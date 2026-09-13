@@ -175,8 +175,8 @@ class PianoTranscriber:
         sustain_frames = self._detect_sustain_zones(cqt_spec)
 
         # 3. Multi-Pitch Onset Detection and Note Segmentation
-        # First difference along time (spectral novelty per pitch)
-        diff_sal = np.diff(salience, axis=1)
+        # First positive difference along time (spectral novelty per pitch) with prepended zeros
+        diff_sal = np.diff(salience, axis=1, prepend=np.zeros((num_bins, 1)))
         diff_sal = np.maximum(0, diff_sal)  # Half-wave rectification
 
         time_axis = librosa.frames_to_time(
@@ -192,22 +192,23 @@ class PianoTranscriber:
             pitch_curve = salience[bin_idx, :]
             onset_curve = diff_sal[bin_idx, :]
 
-            # Adaptive threshold for this pitch
-            local_thresh = max(self.energy_threshold, np.mean(pitch_curve) + 0.10)
+            # Adaptive threshold for this pitch based on baseline floor and min energy threshold
+            min_floor = float(np.min(pitch_curve))
+            local_thresh = max(self.energy_threshold, min_floor + 0.05)
 
-            # Find onset peaks
-            peaks, properties = scipy.signal.find_peaks(
-                onset_curve,
-                height=local_thresh * 0.4,
+            # Find onset peaks with boundary padding
+            pad_onset = np.pad(onset_curve, (1, 1), mode="constant")
+            peaks_pad, properties = scipy.signal.find_peaks(
+                pad_onset,
+                height=local_thresh * 0.3,
                 distance=max(2, int(0.08 * self.sample_rate / self.hop_length))
             )
+            peaks = [p - 1 for p in peaks_pad if 0 <= p - 1 < num_frames]
 
-            for p_idx in peaks:
-                start_frame = p_idx + 1  # diff aligns to frame i+1
-                if start_frame >= num_frames:
-                    continue
-
-                onset_amp = pitch_curve[start_frame]
+            for start_frame in peaks:
+                # Check amplitude at/around attack frame
+                window_end = min(num_frames, start_frame + 3)
+                onset_amp = float(np.max(pitch_curve[start_frame:window_end]))
                 if onset_amp < local_thresh:
                     continue
 

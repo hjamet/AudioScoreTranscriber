@@ -27,7 +27,7 @@ class RhythmTranscriber:
         hop_length: int = 256,
         n_fft: int = 1024,
         refractory_sec: float = 0.030,  # 30 ms refractory window
-        adaptive_delta: float = 0.15,
+        adaptive_delta: float = 0.05,
         min_rms_threshold: float = 0.01
     ):
         self.sample_rate = sample_rate
@@ -40,9 +40,10 @@ class RhythmTranscriber:
     def compute_hfc_odf(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute High Frequency Content (HFC) Onset Detection Function.
-        Weights higher frequency bins linearly with bin index k to emphasize sharp attacks.
+        Weights higher frequency bins linearly and takes positive first difference (flux)
+        to produce sharp, localized attack peaks.
         Returns:
-            odf_norm: normalized onset detection function across frames.
+            odf_norm: normalized onset detection novelty function across frames.
             rms: frame-level root-mean-square energy.
         """
         stft = librosa.stft(y, n_fft=self.n_fft, hop_length=self.hop_length)
@@ -52,16 +53,41 @@ class RhythmTranscriber:
         freq_weights = np.arange(magnitude.shape[0], dtype=np.float32)[:, np.newaxis]
         hfc = np.sum(freq_weights * (magnitude ** 2), axis=0)
 
+        # First positive difference (half-wave rectified novelty)
+        hfc_novelty = np.maximum(0, np.diff(hfc, prepend=hfc[0]))
+
+        # Spectral flux via librosa onset_strength
+        flux = librosa.onset.onset_strength(
+            y=y,
+            sr=self.sample_rate,
+            hop_length=self.hop_length,
+            n_fft=self.n_fft
+        )
+        if len(flux) < len(hfc_novelty):
+            flux = np.pad(flux, (0, len(hfc_novelty) - len(flux)), mode="edge")
+        elif len(flux) > len(hfc_novelty):
+            flux = flux[:len(hfc_novelty)]
+
+        # Normalize both novelty signals
+        max_hfc = np.max(hfc_novelty)
+        if max_hfc > 0:
+            hfc_novelty /= max_hfc
+
+        max_flux = np.max(flux)
+        if max_flux > 0:
+            flux /= max_flux
+
+        # Blended HFC onset novelty
+        combined_odf = 0.65 * hfc_novelty + 0.35 * flux
+
         # Frame RMS energy
         rms = librosa.feature.rms(y=y, frame_length=self.n_fft, hop_length=self.hop_length)[0]
+        if len(rms) < len(combined_odf):
+            rms = np.pad(rms, (0, len(combined_odf) - len(rms)), mode="edge")
+        elif len(rms) > len(combined_odf):
+            rms = rms[:len(combined_odf)]
 
-        # Normalization with smoothing
-        if np.max(hfc) > 0:
-            odf_norm = hfc / np.max(hfc)
-        else:
-            odf_norm = hfc
-
-        return odf_norm, rms
+        return combined_odf, rms
 
     def transcribe(
         self,
@@ -127,17 +153,16 @@ class RhythmTranscriber:
             if last_time >= 0 and (t - last_time) < self.refractory_sec:
                 continue
 
-            # Check local energy to reject false triggers from quiet background noise
-            frame_safe = min(frame_idx, len(rms) - 1)
-            frame_rms = rms[frame_safe]
-            if frame_rms < self.min_rms_threshold:
-                continue
-
-            # Calculate velocity based on attack amplitude
+            # Check local RMS energy in the attack burst window [t, t + 40ms]
             local_start = max(0, int(t * self.sample_rate))
             local_end = min(len(audio), local_start + int(0.040 * self.sample_rate))
             local_slice = audio[local_start:local_end]
-            local_peak = float(np.max(np.abs(local_slice))) if len(local_slice) > 0 else frame_rms
+            local_rms = float(np.sqrt(np.mean(local_slice ** 2))) if len(local_slice) > 0 else 0.0
+            local_peak = float(np.max(np.abs(local_slice))) if len(local_slice) > 0 else 0.0
+
+            # Reject if the attack burst RMS does not exceed ambient noise threshold
+            if local_rms < self.min_rms_threshold or local_peak < (self.min_rms_threshold * 2):
+                continue
 
             # Dynamic velocity scaled between 40 and 127
             velocity = int(np.clip(40 + (local_peak / max(peak_amp, 1e-4)) * 87, 40, 127))
