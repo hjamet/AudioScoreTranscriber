@@ -44,6 +44,7 @@ MuseScore {
     property string statusText: "Prêt"
     property string feedbackText: ""
     property real vuMeterLevel: 0.0
+    property real progressPercent: 0.0
 
     // État du sélecteur d'entrée audio (Microphone)
     property var audioDevices: []
@@ -59,8 +60,9 @@ MuseScore {
     property bool backendStarting: false
     property bool hasSelection: false
 
-    // Playback state model
+    // Playback state model & Métronome
     property var playbackModel: null
+    property bool wasMetronomeActive: false
 
     function normalizePath(path) {
         var p = path.toString();
@@ -102,8 +104,8 @@ MuseScore {
     }
 
     function checkSelection() {
-        if (!curScore) return false;
         try {
+            if (typeof curScore === "undefined" || !curScore) return false;
             if (curScore.selection && curScore.selection.elements && curScore.selection.elements.length > 0) {
                 return true;
             }
@@ -115,7 +117,7 @@ MuseScore {
                 }
             }
         } catch (e) {
-            // Silencieux
+            console.error("[AudioScoreTranscriber] Erreur checkSelection: " + e);
         }
         return false;
     }
@@ -127,35 +129,111 @@ MuseScore {
                 this.load();
                 pluginRoot.playbackModel = this;
             } catch (e) {
-                console.log("[AudioScoreTranscriber] PlaybackToolBarModel notice: " + e);
+                console.error("[AudioScoreTranscriber] PlaybackToolBarModel notice: " + e);
             }
         }
     }
 
     // ========================================================================
-    // Méthodes de Playback MuseScore (Overdubbing)
+    // Méthodes de Playback & Métronome MuseScore (Overdubbing)
     // ========================================================================
-    function startMuseScorePlayback() {
+    function getPlaybackItem(actionName) {
         try {
-            cmd("command://playback/play");
+            if (!pluginRoot.playbackModel || !pluginRoot.playbackModel.items) return null;
+            var items = pluginRoot.playbackModel.items;
+            var count = (typeof items.length === "number") ? items.length : ((typeof items.count === "number") ? items.count : 0);
+            for (var i = 0; i < count; i++) {
+                var item = (items[i] !== undefined) ? items[i] : (typeof items.get === "function" ? items.get(i) : null);
+                if (item) {
+                    var act = (item.action || item.actionName || item.id || item.name || "").toString().toLowerCase();
+                    if (act === actionName.toLowerCase() || act.indexOf(actionName.toLowerCase()) !== -1) {
+                        return item;
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("[AudioScoreTranscriber] Erreur recherche item playback '" + actionName + "': " + e);
+        }
+        return null;
+    }
+
+    function ensureMetronomeActive() {
+        try {
+            var metronomeItem = getPlaybackItem("metronome");
+            if (metronomeItem) {
+                pluginRoot.wasMetronomeActive = !!metronomeItem.checked;
+                if (!metronomeItem.checked) {
+                    if (typeof metronomeItem.activate === "function") {
+                        metronomeItem.activate();
+                    } else if (typeof metronomeItem.trigger === "function") {
+                        metronomeItem.trigger();
+                    }
+                    console.log("[AudioScoreTranscriber] Métronome activé pour l'enregistrement (était inactif)");
+                } else {
+                    console.log("[AudioScoreTranscriber] Métronome déjà actif, conservé actif");
+                }
+            } else {
+                console.log("[AudioScoreTranscriber] Item métronome non trouvé dans playbackModel.items");
+            }
+        } catch (e) {
+            console.error("[AudioScoreTranscriber] Erreur ensureMetronomeActive: " + e);
+        }
+    }
+
+    function restoreMetronomeState() {
+        try {
+            if (pluginRoot.wasMetronomeActive === false) {
+                var metronomeItem = getPlaybackItem("metronome");
+                if (metronomeItem && metronomeItem.checked) {
+                    if (typeof metronomeItem.activate === "function") {
+                        metronomeItem.activate();
+                    } else if (typeof metronomeItem.trigger === "function") {
+                        metronomeItem.trigger();
+                    }
+                    console.log("[AudioScoreTranscriber] Métronome désactivé (restauré à l'état initial)");
+                }
+            }
+        } catch (e) {
+            console.error("[AudioScoreTranscriber] Erreur restoreMetronomeState: " + e);
+        }
+    }
+
+    function startMuseScorePlayback() {
+        ensureMetronomeActive();
+        try {
+            cmd("play-from-selection");
         } catch (e1) {
+            console.error("[AudioScoreTranscriber] startMuseScorePlayback cmd('play-from-selection') failed: " + e1 + ", tentative fallback");
             try {
-                cmd("play");
+                var playItem = getPlaybackItem("play");
+                if (playItem && typeof playItem.activate === "function") {
+                    playItem.activate();
+                } else {
+                    cmd("play");
+                }
             } catch (e2) {
-                console.log("[AudioScoreTranscriber] startMuseScorePlayback notice: " + e2);
+                console.error("[AudioScoreTranscriber] startMuseScorePlayback fallback failed: " + e2);
             }
         }
     }
 
     function stopMuseScorePlayback() {
         try {
-            cmd("command://playback/play");
+            cmd("stop");
         } catch (e1) {
+            console.error("[AudioScoreTranscriber] stopMuseScorePlayback cmd('stop') failed: " + e1);
             try {
-                cmd("stop");
+                var playItem = getPlaybackItem("play");
+                if (playItem && playItem.checked && typeof playItem.activate === "function") {
+                    playItem.activate();
+                } else {
+                    cmd("play");
+                }
             } catch (e2) {
-                console.log("[AudioScoreTranscriber] stopMuseScorePlayback notice: " + e2);
+                console.error("[AudioScoreTranscriber] stopMuseScorePlayback fallback failed: " + e2);
             }
+        } finally {
+            restoreMetronomeState();
         }
     }
 
@@ -268,6 +346,38 @@ MuseScore {
                     appState = "ready";
                     statusText = "Prêt";
                 }
+            } else if (eventType === "progress" || eventType === "heartbeat") {
+                // Interception trames progress & heartbeat : réarmement immédiat du watchdog 15s
+                dspTimeoutTimer.restart();
+
+                if (eventType === "progress") {
+                    var pData = msg.data || msg;
+                    var pct = (pData.percent !== undefined) ? pData.percent : (msg.percent !== undefined ? msg.percent : null);
+                    var stage = pData.stage || msg.stage || "";
+                    var detailMsg = pData.message || msg.message || "";
+
+                    if (pct !== null && pct !== undefined) {
+                        var numericPct = Number(pct);
+                        if (!isNaN(numericPct)) {
+                            pluginRoot.progressPercent = (numericPct > 1.0) ? (numericPct / 100.0) : numericPct;
+                        }
+                    }
+
+                    if (detailMsg) {
+                        pluginRoot.statusText = detailMsg;
+                    } else if (stage) {
+                        var pctStr = (pct !== null && pct !== undefined) ? " : " + Math.round(pluginRoot.progressPercent * 100) + "%" : "";
+                        pluginRoot.statusText = stage + pctStr;
+                    } else if (pct !== null && pct !== undefined) {
+                        pluginRoot.statusText = "Traitement : " + Math.round(pluginRoot.progressPercent * 100) + "%";
+                    }
+
+                    if (pluginRoot.appState !== "processing") {
+                        pluginRoot.appState = "processing";
+                    }
+                } else if (eventType === "heartbeat") {
+                    console.log("[AudioScoreTranscriber] Heartbeat backend reçu, watchdog réarmé.");
+                }
             } else if (eventType === "vu_meter") {
                 if (typeof msg.level === "number") {
                     vuMeterLevel = Math.max(0.0, Math.min(1.0, msg.level));
@@ -321,7 +431,16 @@ MuseScore {
                         }
                         pluginRoot.selectedDeviceIndex = chosenDev.index;
                         pluginRoot.selectedDeviceName = chosenDev.display_name || chosenDev.name;
+                    } else if (msg.devices.length === 0) {
+                        pluginRoot.selectedDeviceIndex = -1;
+                        pluginRoot.selectedDeviceName = "Aucun microphone détecté";
                     }
+
+                    if (statusText.indexOf("GET_DEVICES") !== -1) {
+                        statusText = "Prêt";
+                        feedbackText = "";
+                    }
+
                     console.log("[AudioScoreTranscriber] Micros disponibles : " + msg.devices.length + ", actif : #" + pluginRoot.selectedDeviceIndex + " (" + pluginRoot.selectedDeviceName + ")");
                 }
             } else if (eventType === "device_set") {
@@ -338,6 +457,7 @@ MuseScore {
                 dspTimeoutTimer.stop();
                 appState = "ready";
                 vuMeterLevel = 0.0;
+                progressPercent = 0.0;
 
                 if (overdubCheck.checked && isRecording) {
                     stopMuseScorePlayback();
@@ -347,6 +467,7 @@ MuseScore {
                 injectTranscriptionResult(msg);
             } else if (eventType === "error") {
                 dspTimeoutTimer.stop();
+                progressPercent = 0.0;
                 statusText = "Erreur : " + (msg.message || "inconnue");
                 feedbackText = "❌ " + (msg.message || "Erreur backend");
                 appState = "ready";
@@ -356,7 +477,7 @@ MuseScore {
                 }
             }
         } catch (e) {
-            console.log("[AudioScoreTranscriber] Exception JSON backend message: " + e);
+            console.error("[AudioScoreTranscriber] Exception JSON backend message: " + e);
         }
     }
 
@@ -365,24 +486,36 @@ MuseScore {
     // ========================================================================
     function injectTranscriptionResult(result) {
         statusText = "Injection dans la partition...";
-        var targetMode = result.mode || selectedMode;
-        var events = result.events || result.data || [];
-        var res = null;
+        try {
+            var targetMode = result.mode || selectedMode;
+            var events = result.events || result.data || [];
+            var res = null;
 
-        if (targetMode === "rhythm") {
-            res = ScoreCursorWriter.writeRhythmEvents(events, 60, 0, 0, curScore);
-        } else if (targetMode === "piano") {
-            res = ScoreCursorWriter.writePianoEvents(events, null, curScore);
-        } else if (targetMode === "vocal") {
-            res = ScoreCursorWriter.writeVocalEvents(events, 0, 0, curScore);
-        }
+            if (typeof curScore === "undefined" || !curScore) {
+                feedbackText = "❌ Aucune partition active trouvée";
+                statusText = "Erreur partition";
+                return;
+            }
 
-        if (res && res.success) {
-            feedbackText = "✅ " + (res.count || 0) + " éléments injectés avec succès (" + targetMode + ") !";
-            statusText = "Prêt";
-        } else {
-            var errMsg = res ? (res.error || "Erreur inconnue") : "Échec d'injection";
-            feedbackText = "❌ Échec injection : " + errMsg;
+            if (targetMode === "rhythm") {
+                res = ScoreCursorWriter.writeRhythmEvents(events, 60, 0, 0, curScore);
+            } else if (targetMode === "piano") {
+                res = ScoreCursorWriter.writePianoEvents(events, null, curScore);
+            } else if (targetMode === "vocal") {
+                res = ScoreCursorWriter.writeVocalEvents(events, 0, 0, curScore);
+            }
+
+            if (res && res.success) {
+                feedbackText = "✅ " + (res.count || 0) + " éléments injectés avec succès (" + targetMode + ") !";
+                statusText = "Prêt";
+            } else {
+                var errMsg = res ? (res.error || "Erreur inconnue") : "Échec d'injection";
+                feedbackText = "❌ Échec injection : " + errMsg;
+                statusText = "Erreur d'injection";
+            }
+        } catch (e) {
+            console.error("[AudioScoreTranscriber] Erreur injectTranscriptionResult: " + e);
+            feedbackText = "❌ Exception injection : " + e;
             statusText = "Erreur d'injection";
         }
     }
@@ -429,12 +562,13 @@ MuseScore {
             appState = "processing";
             statusText = "Traitement audio & Inférence...";
             vuMeterLevel = 0.0;
+            progressPercent = 0.0;
 
             if (overdubCheck.checked) {
                 stopMuseScorePlayback();
             }
 
-            // Armement du timeout de sécurité DSP (8 secondes)
+            // Armement de l'Inactivity Watchdog (15 secondes)
             dspTimeoutTimer.restart();
 
             sendWsJson({
@@ -449,21 +583,26 @@ MuseScore {
     // Timers de supervision & Reconnexion
     // ========================================================================
 
-    // Timeout de sécurité DSP (8 secondes max)
+    // Inactivity Watchdog DSP (15 secondes sans trame du backend)
     Timer {
         id: dspTimeoutTimer
-        interval: 8000
+        interval: 15000
         repeat: false
         running: false
         onTriggered: {
-            console.log("[AudioScoreTranscriber] Timeout DSP atteint (8s).");
+            console.error("[AudioScoreTranscriber] Inactivity Watchdog déclenché : aucune réponse du backend en 15s.");
             pluginRoot.appState = "ready";
             pluginRoot.isRecording = false;
             pluginRoot.vuMeterLevel = 0.0;
-            pluginRoot.statusText = "Prêt";
-            pluginRoot.feedbackText = "❌ Délai d'attente dépassé (aucune réponse DSP en 8s)";
+            pluginRoot.progressPercent = 0.0;
+            pluginRoot.statusText = "Erreur : délai dépassé (inactivité > 15s)";
+            pluginRoot.feedbackText = "❌ Délai d'attente dépassé (aucune réponse du moteur en 15s)";
             if (overdubCheck.checked) {
-                pluginRoot.stopMuseScorePlayback();
+                try {
+                    pluginRoot.stopMuseScorePlayback();
+                } catch (e) {
+                    console.error("[AudioScoreTranscriber] Erreur stopMuseScorePlayback sur timeout: " + e);
+                }
             }
         }
     }
@@ -501,10 +640,14 @@ MuseScore {
     }
 
     onRun: {
-        console.log("[AudioScoreTranscriber] Démarrage du plugin");
-        hasSelection = checkSelection();
-        startBackend();
-        connectWebSocket();
+        try {
+            console.log("[AudioScoreTranscriber] Démarrage du plugin");
+            hasSelection = checkSelection();
+            startBackend();
+            connectWebSocket();
+        } catch (e) {
+            console.error("[AudioScoreTranscriber] Erreur onRun: " + e);
+        }
     }
 
     // ========================================================================
@@ -1147,7 +1290,7 @@ MuseScore {
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 90
+                    Layout.preferredHeight: pluginRoot.appState === "processing" ? 100 : 90
                     radius: 10
                     color: !pluginRoot.wsConnected ? "#27272a" :
                            (!pluginRoot.hasSelection && !pluginRoot.isRecording ? "#27272a" :
@@ -1162,7 +1305,7 @@ MuseScore {
                         anchors.margins: 8
                         spacing: 6
 
-                        // Indicateur d'état dynamique & VU-mètre
+                        // Indicateur d'état dynamique & VU-mètre / Jauge de progression
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 8
@@ -1190,11 +1333,11 @@ MuseScore {
                                 font.pixelSize: 12
                                 font.bold: true
                                 color: "#f4f4f5"
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
 
-                            Item { Layout.fillWidth: true }
-
-                            // VU-Mètre horizontal
+                            // Jauge horizontale dynamique (VU-mètre en enregistrement, jauge % en traitement DSP)
                             Rectangle {
                                 Layout.preferredWidth: 90
                                 Layout.preferredHeight: 8
@@ -1203,10 +1346,37 @@ MuseScore {
                                 clip: true
 
                                 Rectangle {
-                                    width: parent.width * pluginRoot.vuMeterLevel
+                                    width: parent.width * (pluginRoot.appState === "processing" ?
+                                           Math.max(0.0, Math.min(1.0, pluginRoot.progressPercent)) :
+                                           pluginRoot.vuMeterLevel)
                                     height: parent.height
                                     radius: 4
-                                    color: pluginRoot.vuMeterLevel > 0.8 ? "#ef4444" : (pluginRoot.vuMeterLevel > 0.5 ? "#f59e0b" : "#10b981")
+                                    color: pluginRoot.appState === "processing" ? "#38bdf8" :
+                                           (pluginRoot.vuMeterLevel > 0.8 ? "#ef4444" :
+                                           (pluginRoot.vuMeterLevel > 0.5 ? "#f59e0b" : "#10b981"))
+                                    Behavior on width {
+                                        NumberAnimation { duration: 100 }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Barre de progression fine active pendant le traitement DSP
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 4
+                            radius: 2
+                            color: "#1e293b"
+                            visible: pluginRoot.appState === "processing"
+                            clip: true
+
+                            Rectangle {
+                                width: parent.width * Math.max(0.0, Math.min(1.0, pluginRoot.progressPercent))
+                                height: parent.height
+                                radius: 2
+                                color: "#38bdf8"
+                                Behavior on width {
+                                    NumberAnimation { duration: 150 }
                                 }
                             }
                         }
@@ -1235,7 +1405,10 @@ MuseScore {
                             Text {
                                 anchors.centerIn: parent
                                 text: !pluginRoot.wsConnected ? "⏳  CONNEXION AU MOTEUR..." :
-                                      (pluginRoot.appState === "processing" ? "⚙️  TRAITEMENT DSP EN COURS..." :
+                                      (pluginRoot.appState === "processing" ?
+                                          (pluginRoot.progressPercent > 0.0 ?
+                                              ("⚙️  TRAITEMENT (" + Math.round(pluginRoot.progressPercent * 100) + "%)") :
+                                              "⚙️  TRAITEMENT DSP EN COURS...") :
                                       (pluginRoot.isRecording ? "⏹️  ARRÊTER & TRANSCRIRE" :
                                       (!pluginRoot.hasSelection ? "⚠️  SÉLECTIONNER UNE MESURE D'ABORD" : "🔴  ENREGISTRER")))
                                 font.pixelSize: 13

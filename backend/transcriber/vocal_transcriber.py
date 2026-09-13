@@ -7,7 +7,7 @@ Estimates F0 using pYIN, applies a 220 ms temporal median filter to cancel
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 import numpy as np
 import scipy.signal
 import scipy.ndimage
@@ -32,7 +32,8 @@ class VocalTranscriber:
         vibrato_window_sec: float = 0.220,  # 220 ms anti-vibrato median filter
         min_plateau_sec: float = 0.100,     # 100 ms stability threshold
         max_pitch_drift_st: float = 0.65,   # Max semitone variation inside a plateau
-        min_rms_threshold: float = 0.015
+        min_rms_threshold: float = 0.015,
+        progress_callback: Optional[Callable[[int, str], None]] = None
     ):
         self.sample_rate = sample_rate
         self.hop_length = hop_length
@@ -43,11 +44,27 @@ class VocalTranscriber:
         self.min_plateau_sec = min_plateau_sec
         self.max_pitch_drift_st = max_pitch_drift_st
         self.min_rms_threshold = min_rms_threshold
+        self.progress_callback = progress_callback
+
+    def _report_progress(
+        self,
+        cb: Optional[Callable[[int, str], None]],
+        percent: int,
+        stage: str
+    ):
+        """Dispatch progress update to local or instance callback."""
+        active_cb = cb or self.progress_callback
+        if active_cb is not None:
+            try:
+                active_cb(int(percent), str(stage))
+            except Exception as exc:
+                logger.debug("Progress callback exception: %s", exc)
 
     def transcribe(
         self,
         audio: np.ndarray,
-        sr: Optional[int] = None
+        sr: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> List[Dict[str, Any]]:
         """
         Transcribe singing voice audio into structured melodic note events.
@@ -55,6 +72,7 @@ class VocalTranscriber:
         Args:
             audio: 1D float32 audio array.
             sr: Input sample rate.
+            progress_callback: Optional callback(percent: int, stage: str) reporting progress.
 
         Returns:
             List of note dicts: [{"pitch": int, "start_time": float, "end_time": float,
@@ -62,6 +80,7 @@ class VocalTranscriber:
         """
         if len(audio) < self.frame_length:
             logger.warning("Audio buffer too short for vocal transcription")
+            self._report_progress(progress_callback, 100, "Audio trop court")
             return []
 
         orig_sr = sr or self.sample_rate
@@ -72,9 +91,12 @@ class VocalTranscriber:
         peak = np.max(np.abs(audio))
         if peak < self.min_rms_threshold:
             logger.info("Vocal signal below noise floor")
+            self._report_progress(progress_callback, 100, "Signal en-dessous du seuil")
             return []
 
         # 1. Fundamental frequency estimation via pYIN
+        self._report_progress(progress_callback, 10, "Début extraction pitch pYIN")
+        self._report_progress(progress_callback, 20, "Inférence pYIN en cours")
         try:
             f0, voiced_flag, voiced_probs = librosa.pyin(
                 audio,
@@ -87,9 +109,13 @@ class VocalTranscriber:
             )
         except Exception as exc:
             logger.error("pYIN F0 extraction failed: %s", exc)
+            self._report_progress(progress_callback, 100, "Erreur extraction pYIN")
             return []
 
+        self._report_progress(progress_callback, 60, "Inférence pYIN terminée")
+
         if f0 is None or len(f0) == 0:
+            self._report_progress(progress_callback, 100, "Aucun F0 détecté")
             return []
 
         num_frames = len(f0)
@@ -112,6 +138,7 @@ class VocalTranscriber:
 
         # 3. Apply 220 ms Temporal Median Filter (Anti-Vibrato)
         # Neutralizes 5-7 Hz vocal vibrato without blurring note attack transitions
+        self._report_progress(progress_callback, 70, "Post-traitement & filtrage vibrato/glissando")
         frame_rate = self.sample_rate / self.hop_length
         median_kernel_size = int(round(self.vibrato_window_sec * frame_rate))
         if median_kernel_size % 2 == 0:
@@ -121,6 +148,7 @@ class VocalTranscriber:
         filtered_midi = self._apply_nan_median_filter(midi_pitches, median_kernel_size)
 
         # 4. Stable Plateau Detection (>= 100 ms) and Glissando/Transient Elimination
+        self._report_progress(progress_callback, 85, "Segmentation en notes")
         min_plateau_frames = max(2, int(round(self.min_plateau_sec * frame_rate)))
         notes = self._extract_plateaux(
             filtered_midi,
@@ -131,6 +159,7 @@ class VocalTranscriber:
         )
 
         logger.info("Transcribed %d vocal melodic notes", len(notes))
+        self._report_progress(progress_callback, 100, "Finalisation")
         return notes
 
     def _apply_nan_median_filter(self, signal: np.ndarray, kernel_size: int) -> np.ndarray:

@@ -243,6 +243,90 @@ function initCursor(score, staffIdx, voice) {
 }
 
 // ============================================================================
+// EXTRACTEUR POLYMORPHE D'ÉVÉNEMENTS
+// ============================================================================
+
+/**
+ * Extrait une liste plate d'événements musicaux à partir de n'importe quel format reçu :
+ * - Cas 1 : Array.isArray(payload) -> retourner directement le tableau.
+ * - Cas 2 : payload.events && Array.isArray(payload.events) -> retourner payload.events.
+ * - Cas 3 : payload.measures && Array.isArray(payload.measures) -> aplatir récursivement les événements de toutes les mesures (vérifier measure.items ou measure.events ou measure.notes).
+ * - Cas 4 : payload.data encapsulé -> vérifier récursivement si payload.data contient events ou measures.
+ * 
+ * Si aucun événement n'est trouvé, journalise un avertissement clair avec console.warn et retourne [].
+ * 
+ * @param {*} payload - Payload d'événements bruts (tableau, objet avec events, measures, ou encapsulé dans data)
+ * @returns {Array} Liste plate d'événements musicaux
+ */
+function extractFlatEvents(payload) {
+    var extracted = _extractRawFlatEvents(payload);
+    if (!extracted || !Array.isArray(extracted) || extracted.length === 0) {
+        var payloadStr = "";
+        try {
+            payloadStr = JSON.stringify(payload);
+        } catch (err) {
+            payloadStr = "[Objet non sérialisable: " + err + "]";
+        }
+        console.warn("ScoreCursorWriter: Aucun événement extrait du payload", payloadStr);
+        return [];
+    }
+    return extracted;
+}
+
+/**
+ * Logique interne récursive pour l'extraction polymorphe
+ */
+function _extractRawFlatEvents(payload) {
+    if (!payload) {
+        return [];
+    }
+
+    // Cas 1 : Array.isArray(payload) -> retourner directement le tableau
+    if (Array.isArray(payload)) {
+        return payload;
+    }
+
+    if (typeof payload !== "object") {
+        return [];
+    }
+
+    // Cas 2 : payload.events && Array.isArray(payload.events) -> retourner payload.events
+    if (payload.events && Array.isArray(payload.events)) {
+        return payload.events;
+    }
+
+    // Cas 3 : payload.measures && Array.isArray(payload.measures) -> aplatir récursivement les événements de toutes les mesures
+    if (payload.measures && Array.isArray(payload.measures)) {
+        var flatMeasures = [];
+        for (var m = 0; m < payload.measures.length; m++) {
+            var measure = payload.measures[m];
+            if (!measure) continue;
+            var items = measure.items || measure.events || measure.notes;
+            if (items && Array.isArray(items)) {
+                for (var it = 0; it < items.length; it++) {
+                    if (items[it] !== undefined && items[it] !== null) {
+                        flatMeasures.push(items[it]);
+                    }
+                }
+            }
+        }
+        if (flatMeasures.length > 0) {
+            return flatMeasures;
+        }
+    }
+
+    // Cas 4 : payload.data encapsulé -> vérifier récursivement si payload.data contient events ou measures
+    if (payload.data !== undefined && payload.data !== null) {
+        var fromData = _extractRawFlatEvents(payload.data);
+        if (fromData && Array.isArray(fromData) && fromData.length > 0) {
+            return fromData;
+        }
+    }
+
+    return [];
+}
+
+// ============================================================================
 // FONCTION 1 : Injection Rythme Seul (Mode 1)
 // ============================================================================
 
@@ -251,12 +335,12 @@ function initCursor(score, staffIdx, voice) {
  * Injecte les durées de notes et silences quantifiés.
  * Si aucun pitch n'est spécifié, utilise la note actuellement sélectionnée ou C4 (pitch 60).
  * 
- * @param {Array} events - Liste d'événements rythmiques quantifiés
+ * @param {Array|Object} events - Événements rythmiques quantifiés (polymorphe)
  * @param {number} pitchDefaut - Pitch MIDI optionnel (ex: 60)
  * @param {number} staffIdx - Index de portée (défaut 0)
  * @param {number} voice - Index de voix (défaut 0)
  * @param {Object} scoreObj - Référence score optionnelle (fallback curScore)
- * @returns {Object} Résultat de l'opération { success, count, mode }
+ * @returns {Object} Résultat de l'opération { success, count, totalEvents, mode }
  */
 function writeRhythmEvents(events, pitchDefaut, staffIdx, voice, scoreObj) {
     var score = scoreObj || (typeof curScore !== "undefined" ? curScore : null);
@@ -265,10 +349,19 @@ function writeRhythmEvents(events, pitchDefaut, staffIdx, voice, scoreObj) {
         return { success: false, error: "No active score" };
     }
 
-    if (!events || !Array.isArray(events) || events.length === 0) {
+    var flatEvents = extractFlatEvents(events);
+    if (!flatEvents || flatEvents.length === 0) {
         console.log("[ScoreCursorWriter] Avertissement : Aucun événement rythmique à injecter.");
         return { success: true, count: 0 };
     }
+
+    var noteCount = 0;
+    var restCount = 0;
+    for (var d = 0; d < flatEvents.length; d++) {
+        if (isRestEvent(flatEvents[d])) restCount++;
+        else noteCount++;
+    }
+    console.log("[ScoreCursorWriter] writeRhythmEvents: " + flatEvents.length + " événements extraits (" + noteCount + " notes, " + restCount + " silences).");
 
     // Détermination du pitch cible
     var targetPitch = getSelectedPitch(score, pitchDefaut);
@@ -280,14 +373,17 @@ function writeRhythmEvents(events, pitchDefaut, staffIdx, voice, scoreObj) {
     try {
         var cursor = initCursor(score, staff, v);
 
-        for (var i = 0; i < events.length; i++) {
-            var ev = events[i];
+        for (var i = 0; i < flatEvents.length; i++) {
+            var ev = flatEvents[i];
             if (!ev) continue;
 
             var dur = parseDuration(ev);
+            var isRest = isRestEvent(ev);
+            console.log("[ScoreCursorWriter] [Rhythm] Event #" + (i + 1) + "/" + flatEvents.length + " -> Type: " + (isRest ? "rest" : "note") + ", Durée: " + dur.num + "/" + dur.denom);
+
             cursor.setDuration(dur.num, dur.denom);
 
-            if (isRestEvent(ev)) {
+            if (isRest) {
                 cursor.addRest();
             } else {
                 var p = (typeof ev.pitch === "number") ? ev.pitch : targetPitch;
@@ -295,8 +391,8 @@ function writeRhythmEvents(events, pitchDefaut, staffIdx, voice, scoreObj) {
                 insertedCount++;
             }
         }
-        console.log("[ScoreCursorWriter] Rythme injecté avec succès (" + insertedCount + " notes, " + events.length + " événements).");
-        return { success: true, count: insertedCount, totalEvents: events.length, mode: "rhythm" };
+        console.log("[ScoreCursorWriter] Rythme injecté avec succès (" + insertedCount + " notes, " + flatEvents.length + " événements).");
+        return { success: true, count: insertedCount, totalEvents: flatEvents.length, mode: "rhythm" };
     } catch (err) {
         console.log("[ScoreCursorWriter] Exception lors de writeRhythmEvents : " + err);
         return { success: false, error: String(err) };
@@ -335,10 +431,14 @@ function writePianoEvents(events, staffIdx, scoreObj) {
 
     score.startCmd();
     try {
-        // Cas A : Objet avec flux séparés { treble: [...], bass: [...] } ou { staff0: [...], staff1: [...] }
-        if (!Array.isArray(events) && typeof events === "object") {
-            var trebleEvents = events.treble || events.right || events.staff0 || [];
-            var bassEvents = events.bass || events.left || events.staff1 || [];
+        // Cas A : Objet avec flux séparés explicites { treble: [...], bass: [...] } ou { staff0: [...], staff1: [...] }
+        if (!Array.isArray(events) && typeof events === "object" && (events.treble || events.bass || events.right || events.left || events.staff0 || events.staff1)) {
+            var rawTreble = events.treble || events.right || events.staff0 || [];
+            var rawBass = events.bass || events.left || events.staff1 || [];
+            var trebleEvents = extractFlatEvents(rawTreble);
+            var bassEvents = extractFlatEvents(rawBass);
+
+            console.log("[ScoreCursorWriter] writePianoEvents (flux séparés): " + trebleEvents.length + " main droite, " + bassEvents.length + " main gauche.");
 
             if (trebleEvents.length > 0) {
                 var resTreble = injectPianoStaffEvents(score, trebleEvents, 0);
@@ -353,10 +453,24 @@ function writePianoEvents(events, staffIdx, scoreObj) {
             return { success: true, count: insertedNotes, chords: insertedChords, mode: "piano" };
         }
 
-        // Cas B : Tableau plat d'événements
+        // Cas B & C : Extraction polymorphe des événements plats
+        var flatEvents = extractFlatEvents(events);
+        if (!flatEvents || flatEvents.length === 0) {
+            console.log("[ScoreCursorWriter] Avertissement : Aucun événement piano à injecter.");
+            return { success: true, count: 0 };
+        }
+
+        var noteCount = 0;
+        var restCount = 0;
+        for (var d = 0; d < flatEvents.length; d++) {
+            if (isRestEvent(flatEvents[d])) restCount++;
+            else noteCount++;
+        }
+        console.log("[ScoreCursorWriter] writePianoEvents: " + flatEvents.length + " événements extraits (" + noteCount + " notes/accords, " + restCount + " silences).");
+
+        // Cas B : Portée explicite spécifiée
         if (staffIdx !== undefined && staffIdx !== null) {
-            // Portée explicite spécifiée
-            var res = injectPianoStaffEvents(score, events, staffIdx);
+            var res = injectPianoStaffEvents(score, flatEvents, staffIdx);
             return { success: true, count: res.notes, chords: res.chords, mode: "piano" };
         }
 
@@ -364,8 +478,8 @@ function writePianoEvents(events, staffIdx, scoreObj) {
         var rightHandEvents = [];
         var leftHandEvents = [];
 
-        for (var i = 0; i < events.length; i++) {
-            var ev = events[i];
+        for (var i = 0; i < flatEvents.length; i++) {
+            var ev = flatEvents[i];
             if (!ev) continue;
 
             if (ev.staff === 1 || ev.hand === "left" || ev.hand === "lh") {
@@ -445,13 +559,13 @@ function injectPianoStaffEvents(score, staffEvents, staffIdx) {
         var dur = parseDuration(ev);
         cursor.setDuration(dur.num, dur.denom);
 
-        if (isRestEvent(ev)) {
-            cursor.addRest();
-            continue;
-        }
+        var isRest = isRestEvent(ev);
+        var chordPitches = isRest ? [] : extractPitches(ev);
+        var typeDesc = isRest ? "rest" : (chordPitches.length > 1 ? "chord" : "note");
 
-        var chordPitches = extractPitches(ev);
-        if (chordPitches.length === 0) {
+        console.log("[ScoreCursorWriter] [Piano Portée " + staffIdx + "] Event #" + (i + 1) + "/" + staffEvents.length + " -> Type: " + typeDesc + ", Durée: " + dur.num + "/" + dur.denom + (chordPitches.length > 0 ? ", Pitches: [" + chordPitches.join(",") + "]" : ""));
+
+        if (isRest || chordPitches.length === 0) {
             cursor.addRest();
             continue;
         }
@@ -478,23 +592,46 @@ function injectPianoStaffEvents(score, staffEvents, staffIdx) {
  * Injecte la ligne mélodique monophonique avec liaisons (cmd("tie"))
  * si une note chevauche une barre de mesure ou demande une tenue.
  * 
- * @param {Array} events - Liste d'événements mélodiques monophoniques quantifiés
+ * @param {Array|Object} events - Événements mélodiques monophoniques quantifiés (polymorphe)
  * @param {number} staffIdx - Index de portée (défaut 0)
  * @param {number} voice - Index de voix (défaut 0)
+ * @param {number|Object} targetTick - Position de tick cible optionnelle (ou scoreObj si 4 arguments)
  * @param {Object} scoreObj - Référence score optionnelle
- * @returns {Object} Résultat de l'opération { success, count, mode }
+ * @returns {Object} Résultat de l'opération { success, count, ties, mode }
  */
-function writeVocalEvents(events, staffIdx, voice, scoreObj) {
-    var score = scoreObj || (typeof curScore !== "undefined" ? curScore : null);
+function writeVocalEvents(events, staffIdx, voice, targetTick, scoreObj) {
+    var score = null;
+    var tTick = null;
+
+    if (targetTick && typeof targetTick === "object") {
+        // targetTick passé comme objet Score (compatibilité appel 4 arguments hérité)
+        score = targetTick;
+        tTick = 0;
+    } else {
+        if (typeof targetTick === "number") {
+            tTick = targetTick;
+        }
+        score = scoreObj || (typeof curScore !== "undefined" ? curScore : null);
+    }
+
     if (!score) {
         console.log("[ScoreCursorWriter] Erreur : Aucune partition active trouvée.");
         return { success: false, error: "No active score" };
     }
 
-    if (!events || !Array.isArray(events) || events.length === 0) {
+    var flatEvents = extractFlatEvents(events);
+    if (!flatEvents || flatEvents.length === 0) {
         console.log("[ScoreCursorWriter] Avertissement : Aucun événement vocal à injecter.");
         return { success: true, count: 0 };
     }
+
+    var noteCount = 0;
+    var restCount = 0;
+    for (var d = 0; d < flatEvents.length; d++) {
+        if (isRestEvent(flatEvents[d])) restCount++;
+        else noteCount++;
+    }
+    console.log("[ScoreCursorWriter] writeVocalEvents: " + flatEvents.length + " événements extraits (" + noteCount + " notes, " + restCount + " silences).");
 
     var staff = (staffIdx !== undefined && staffIdx !== null) ? staffIdx : 0;
     var v = (voice !== undefined && voice !== null) ? voice : 0;
@@ -505,20 +642,30 @@ function writeVocalEvents(events, staffIdx, voice, scoreObj) {
     try {
         var cursor = initCursor(score, staff, v);
 
-        for (var i = 0; i < events.length; i++) {
-            var ev = events[i];
+        // Positionnement optionnel sur targetTick
+        if (tTick !== null && tTick > 0) {
+            while (cursor.segment && getCursorTick(cursor) < tTick) {
+                if (!cursor.next()) break;
+            }
+        }
+
+        for (var i = 0; i < flatEvents.length; i++) {
+            var ev = flatEvents[i];
             if (!ev) continue;
 
             var dur = parseDuration(ev);
+            var isRest = isRestEvent(ev);
+
+            console.log("[ScoreCursorWriter] [Vocal] Event #" + (i + 1) + "/" + flatEvents.length + " -> Type: " + (isRest ? "rest" : "note") + ", Durée: " + dur.num + "/" + dur.denom + (isRest ? "" : ", Pitch: " + (typeof ev.pitch === "number" ? ev.pitch : 60)));
 
             // Gestion du silence
-            if (isRestEvent(ev)) {
+            if (isRest) {
                 cursor.setDuration(dur.num, dur.denom);
                 cursor.addRest();
                 continue;
             }
 
-            var pitch = (typeof ev.pitch === "number") ? ev.pitch : 60;
+            var pitch = (typeof ev.pitch === "number") ? ev.pitch : (Array.isArray(ev.pitches) && ev.pitches.length > 0 ? ev.pitches[0] : 60);
             var noteTicks = fractionToTicks(dur.num, dur.denom);
             var remainingTicks = getRemainingTicksInMeasure(cursor);
 

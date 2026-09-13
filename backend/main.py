@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import argparse
-from typing import Set, Optional, Dict, Any
+from typing import Set, Optional, Dict, Any, Callable, List
 import numpy as np
 
 # Configure logging
@@ -121,7 +121,7 @@ class ServerOrchestrator:
         self,
         port: int = 8085,
         enable_watchdog: bool = True,
-        watchdog_timeout_sec: float = 30.0
+        watchdog_timeout_sec: float = 120.0
     ):
         self.port = port
         self.enable_watchdog = enable_watchdog
@@ -148,6 +148,25 @@ class ServerOrchestrator:
         self.connected_clients: Set[Any] = set()
         self._watchdog_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+
+        # Pre-warm Numba JIT compiler to eliminate latency spike on first transcribe request
+        self.warmup()
+
+    def warmup(self):
+        """
+        Pre-warm Numba JIT compiler by executing a mini 0.1s pYIN inference.
+        Eliminates the JIT compilation spike on the first user request.
+        """
+        try:
+            logger.info("Préchauffage JIT Numba en cours (mini pYIN 0.1s)...")
+            sr = 22050
+            # 0.1s at 22050 Hz is 2205 samples (> frame_length 2048)
+            t = np.linspace(0, 0.1, int(sr * 0.1), endpoint=False, dtype=np.float32)
+            sine = (0.5 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+            self.vocal_transcriber.transcribe(sine, sr=sr)
+            logger.info("Préchauffage JIT Numba terminé avec succès.")
+        except Exception as exc:
+            logger.warning("Préchauffage JIT Numba ignoré / exception: %s", exc)
 
     def start_watchdog(self):
         """Schedule anti-zombie shutdown if no client is connected."""
@@ -199,45 +218,61 @@ class ServerOrchestrator:
             await self._send_error(websocket, f"Invalid JSON payload: {exc}")
             return
 
-        cmd = req.get("command", "").upper()
-        logger.info("Received command: %s", cmd)
+        if not isinstance(req, dict):
+            await self._send_error(websocket, "Payload must be a JSON object")
+            return
 
-        if cmd in ["HANDSHAKE", "PING"]:
+        raw_cmd = req.get("command") or req.get("type") or req.get("action") or ""
+        cmd = str(raw_cmd).strip().upper()
+        logger.info("Received command: '%s' (payload: %s)", cmd, req)
+
+        if cmd in ["HANDSHAKE", "PING", "CONNECT", "INIT"]:
             await self._handle_handshake(websocket, req)
-        elif cmd == "GET_DEVICES":
+        elif cmd in ["GET_DEVICES", "DEVICES", "LIST_DEVICES", "GET_DEVICE_LIST", "REFRESH_DEVICES"]:
             await self._send_devices_list(websocket)
-        elif cmd == "SET_DEVICE":
+        elif cmd in ["SET_DEVICE", "SELECT_DEVICE", "CHOOSE_DEVICE"]:
             await self._handle_set_device(websocket, req)
-        elif cmd == "GET_STATUS":
+        elif cmd in ["GET_STATUS", "STATUS"]:
             await self._handle_get_status(websocket)
-        elif cmd == "SET_MODE":
+        elif cmd in ["SET_MODE", "MODE"]:
             await self._handle_set_mode(websocket, req)
-        elif cmd == "SET_LATENCY":
+        elif cmd in ["SET_LATENCY", "LATENCY"]:
             await self._handle_set_latency(websocket, req)
-        elif cmd == "START_RECORDING":
+        elif cmd in ["START_RECORDING", "START", "RECORD"]:
             await self._handle_start_recording(websocket, req)
-        elif cmd == "STOP_RECORDING":
+        elif cmd in ["STOP_RECORDING", "STOP"]:
             await self._handle_stop_recording(websocket, req)
-        elif cmd == "TRANSCRIBE_AUDIO":
+        elif cmd in ["TRANSCRIBE_AUDIO", "TRANSCRIBE"]:
             await self._handle_transcribe_audio(websocket, req)
         else:
             await self._send_error(websocket, f"Unknown command: '{cmd}'")
 
     async def _send_devices_list(self, websocket):
         """Send the list of available audio input devices and current selection to the client."""
-        devices = self.audio_engine.get_devices()
-        current_dev = self.audio_engine.device_index
-        if current_dev is None and devices:
-            current_dev = devices[0]["index"]
+        try:
+            devices = self.audio_engine.get_devices()
+            current_dev = self.audio_engine.device_index
+            if (current_dev is None or not any(d.get("index") == current_dev for d in devices)) and devices:
+                default_dev = next((d["index"] for d in devices if d.get("is_default")), devices[0]["index"])
+                current_dev = default_dev
 
-        payload = {
-            "event": "DEVICES_LIST",
-            "type": "devices_list",
-            "devices": devices,
-            "current_device": current_dev
-        }
-        logger.info("Sending devices list (%d devices, current=%s)", len(devices), current_dev)
-        await websocket.send(json.dumps(payload))
+            payload = {
+                "event": "DEVICES_LIST",
+                "type": "devices_list",
+                "devices": devices,
+                "current_device": current_dev
+            }
+            logger.info("Sending devices list (%d devices, current=%s)", len(devices), current_dev)
+            await websocket.send(json.dumps(payload))
+        except Exception as exc:
+            logger.error("Error retrieving devices list: %s", exc, exc_info=True)
+            await websocket.send(json.dumps({
+                "event": "DEVICES_LIST",
+                "type": "devices_list",
+                "devices": [],
+                "current_device": -1,
+                "error": str(exc)
+            }))
 
     async def _handle_set_device(self, websocket, req: Dict[str, Any]):
         """Handle SET_DEVICE command to change active input device."""
@@ -385,6 +420,20 @@ class ServerOrchestrator:
         bpm_override = req.get("bpm")
 
         loop = asyncio.get_running_loop()
+
+        def sync_progress_cb(percent: int, stage: str):
+            payload = json.dumps({
+                "type": "progress",
+                "percent": int(percent),
+                "stage": str(stage)
+            })
+            async def _send_progress():
+                try:
+                    await websocket.send(payload)
+                except Exception as ex:
+                    logger.debug("Failed to relay progress over WebSocket: %s", ex)
+            loop.call_soon_threadsafe(asyncio.create_task, _send_progress())
+
         result_payload = await loop.run_in_executor(
             None,
             self._execute_transcription_pipeline,
@@ -392,16 +441,21 @@ class ServerOrchestrator:
             self.audio_engine.sample_rate,
             self.mode,
             bpm_override,
-            export_musicxml
+            export_musicxml,
+            sync_progress_cb
         )
+
+        qml_data = result_payload.get("qml_json", {})
+        flat_events = qml_data.get("events", []) if isinstance(qml_data, dict) else []
 
         self.status = "idle"
         await websocket.send(json.dumps({
             "event": "TRANSCRIPTION_RESULT",
             "type": "transcription_result",
             "mode": self.mode,
-            "events": result_payload["qml_json"],
-            "data": result_payload["qml_json"],
+            "events": flat_events,
+            "qml_json": qml_data,
+            "data": qml_data,
             "musicxml": result_payload.get("musicxml", ""),
             "raw_notes_count": result_payload.get("raw_notes_count", 0)
         }))
@@ -422,6 +476,20 @@ class ServerOrchestrator:
         self.status = "transcribing"
 
         loop = asyncio.get_running_loop()
+
+        def sync_progress_cb(percent: int, stage: str):
+            payload = json.dumps({
+                "type": "progress",
+                "percent": int(percent),
+                "stage": str(stage)
+            })
+            async def _send_progress():
+                try:
+                    await websocket.send(payload)
+                except Exception as ex:
+                    logger.debug("Failed to relay progress over WebSocket: %s", ex)
+            loop.call_soon_threadsafe(asyncio.create_task, _send_progress())
+
         result_payload = await loop.run_in_executor(
             None,
             self._execute_transcription_pipeline,
@@ -429,14 +497,23 @@ class ServerOrchestrator:
             sr,
             mode,
             bpm,
-            export_xml
+            export_xml,
+            sync_progress_cb
         )
+
+        qml_data = result_payload.get("qml_json", {})
+        flat_events = qml_data.get("events", []) if isinstance(qml_data, dict) else []
 
         self.status = "idle"
         await websocket.send(json.dumps({
             "event": "TRANSCRIPTION_RESULT",
-            "data": result_payload["qml_json"],
-            "musicxml": result_payload.get("musicxml", "")
+            "type": "transcription_result",
+            "mode": mode,
+            "events": flat_events,
+            "qml_json": qml_data,
+            "data": qml_data,
+            "musicxml": result_payload.get("musicxml", ""),
+            "raw_notes_count": result_payload.get("raw_notes_count", 0)
         }))
 
     def _execute_transcription_pipeline(
@@ -445,7 +522,8 @@ class ServerOrchestrator:
         sr: int,
         mode: str,
         bpm_override: Optional[float] = None,
-        export_musicxml: bool = False
+        export_musicxml: bool = False,
+        progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> Dict[str, Any]:
         """
         Execute the end-to-end transcription pipeline:
@@ -453,15 +531,24 @@ class ServerOrchestrator:
         """
         logger.info("Executing transcription pipeline: %d samples, sr=%d, mode=%s", len(audio), sr, mode)
 
+        if progress_callback:
+            progress_callback(5, "Démarrage de la transcription")
+
         # 1. Multi-mode AI transcription
         if mode == "rhythm":
+            if progress_callback:
+                progress_callback(20, "Détection des attaques percussives")
             raw_events = self.rhythm_transcriber.transcribe(audio, sr=sr)
+            if progress_callback:
+                progress_callback(70, "Estimation du tempo")
             detected_bpm = self.rhythm_transcriber.estimate_tempo_bpm(raw_events, fallback_bpm=self.active_bpm)
         elif mode == "piano":
+            if progress_callback:
+                progress_callback(20, "Transcription polyphonique piano")
             raw_events = self.piano_transcriber.transcribe(audio, sr=sr)
             detected_bpm = self.active_bpm
         elif mode == "vocal":
-            raw_events = self.vocal_transcriber.transcribe(audio, sr=sr)
+            raw_events = self.vocal_transcriber.transcribe(audio, sr=sr, progress_callback=progress_callback)
             detected_bpm = self.active_bpm
         else:
             raw_events = []
@@ -470,9 +557,13 @@ class ServerOrchestrator:
         effective_bpm = bpm_override if (bpm_override is not None and bpm_override > 0) else detected_bpm
 
         # 2. Elaine Gould adaptive quantization
+        if progress_callback:
+            progress_callback(90, "Quantification adaptative Gould")
         quantized_score = self.quantizer.quantize(raw_events, bpm=effective_bpm)
 
         # 3. Serialization to QML JSON
+        if progress_callback:
+            progress_callback(95, "Sérialisation QML et MusicXML")
         qml_json = self.musicxml_writer.to_qml_json(quantized_score, mode=mode)
 
         # 4. Optional MusicXML generation
@@ -483,6 +574,9 @@ class ServerOrchestrator:
                 title=f"AudioScore - {mode.capitalize()} Transcription",
                 mode=mode
             )
+
+        if progress_callback:
+            progress_callback(100, "Transcription terminée")
 
         return {
             "qml_json": qml_json,
@@ -526,7 +620,7 @@ def main():
     parser = argparse.ArgumentParser(description="AudioScoreTranscriber Python Backend")
     parser.add_argument("--port", type=int, default=8085, help="WebSocket port (default: 8085)")
     parser.add_argument("--no-watchdog", action="store_true", help="Disable anti-zombie auto-termination")
-    parser.add_argument("--watchdog-timeout", type=float, default=30.0, help="Watchdog timeout in seconds (default: 30.0)")
+    parser.add_argument("--watchdog-timeout", type=float, default=120.0, help="Watchdog timeout in seconds (default: 120.0)")
     args = parser.parse_args()
 
     # Single-instance lock on Windows

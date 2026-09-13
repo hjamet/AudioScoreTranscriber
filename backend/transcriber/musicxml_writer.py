@@ -36,6 +36,53 @@ def np_clip_pitch(p: int) -> int:
     return max(0, min(127, int(p)))
 
 
+def duration_beats_to_fraction(duration_beats: float, is_triplet: bool = False) -> Tuple[int, int]:
+    """
+    Convert musical duration in quarter beats to fraction (num, denom) relative to whole note.
+    Compatible with MuseScore cursor.setDuration(num, denom).
+    """
+    import math
+
+    if is_triplet:
+        if abs(duration_beats - 2.0 / 3.0) < 0.05:
+            return 1, 6
+        elif abs(duration_beats - 1.0 / 3.0) < 0.05:
+            return 1, 12
+        elif abs(duration_beats - 1.0 / 6.0) < 0.05:
+            return 1, 24
+        elif abs(duration_beats - 4.0 / 3.0) < 0.05:
+            return 1, 3
+        elif abs(duration_beats - 2.0) < 0.05:
+            return 1, 2
+
+    if abs(duration_beats - 4.0) < 0.05:
+        return 1, 1
+    elif abs(duration_beats - 3.0) < 0.05:
+        return 3, 4
+    elif abs(duration_beats - 2.0) < 0.05:
+        return 1, 2
+    elif abs(duration_beats - 1.5) < 0.05:
+        return 3, 8
+    elif abs(duration_beats - 1.0) < 0.05:
+        return 1, 4
+    elif abs(duration_beats - 0.75) < 0.05:
+        return 3, 16
+    elif abs(duration_beats - 0.5) < 0.05:
+        return 1, 8
+    elif abs(duration_beats - 0.375) < 0.05:
+        return 3, 32
+    elif abs(duration_beats - 0.25) < 0.05:
+        return 1, 16
+    elif abs(duration_beats - 0.125) < 0.05:
+        return 1, 32
+    else:
+        whole_fraction = duration_beats / 4.0
+        denom = 64
+        num = max(1, int(round(whole_fraction * denom)))
+        g = math.gcd(num, denom)
+        return num // g, denom // g
+
+
 class MusicXMLScoreWriter:
     """
     Score serialization engine supporting QML JSON format and MusicXML 3.1.
@@ -53,6 +100,7 @@ class MusicXMLScoreWriter:
     ) -> Dict[str, Any]:
         """
         Format quantized score data into a clean JSON structure for QML / WebSocket client.
+        Always includes the complete flat events list under the 'events' key.
         """
         bpm = quantized_score.get("tempo_bpm", 120.0)
         time_sig = quantized_score.get("time_signature", [4, 4])
@@ -61,7 +109,9 @@ class MusicXMLScoreWriter:
         # Choose appropriate clef based on mode and pitch range
         clef = self._determine_clef(raw_measures, mode)
 
+        flat_events_list: List[Dict[str, Any]] = []
         formatted_measures = []
+
         for meas in raw_measures:
             m_num = meas["measure_number"]
             m_items = []
@@ -75,15 +125,27 @@ class MusicXMLScoreWriter:
                 tie_start = item.get("tie_start", False)
                 tie_stop = item.get("tie_stop", False)
 
+                num, denom = duration_beats_to_fraction(duration_beats, is_triplet)
+
                 if item_type == "rest":
-                    m_items.append({
+                    item_dict = {
                         "type": "rest",
+                        "isRest": True,
+                        "pitch": None,
+                        "pitches": [],
                         "beat": beat,
+                        "beat_in_measure": beat,
+                        "measure_number": m_num,
                         "duration_beats": duration_beats,
                         "duration_type": dur_type,
+                        "num": num,
+                        "denom": denom,
+                        "duration": {"num": num, "denom": denom},
                         "gould_name": item.get("gould_name", "soupir"),
                         "is_triplet": is_triplet
-                    })
+                    }
+                    m_items.append(item_dict)
+                    flat_events_list.append(dict(item_dict))
                 else:
                     # Note or chord
                     pitches = item.get("pitches", [60])
@@ -94,6 +156,7 @@ class MusicXMLScoreWriter:
                         step, alter, oct_num, name = midi_to_step_alter_octave(p)
                         notes_info.append({
                             "midi": p,
+                            "pitch": p,
                             "name": name,
                             "step": step,
                             "alter": alter,
@@ -101,16 +164,28 @@ class MusicXMLScoreWriter:
                             "velocity": v
                         })
 
-                    m_items.append({
+                    item_dict = {
                         "type": item_type,
+                        "isRest": False,
+                        "pitch": pitches[0] if pitches else 60,
+                        "pitches": pitches,
+                        "velocities": velocities,
+                        "velocity": velocities[0] if velocities else 80,
                         "beat": beat,
+                        "beat_in_measure": beat,
+                        "measure_number": m_num,
                         "duration_beats": duration_beats,
                         "duration_type": dur_type,
+                        "num": num,
+                        "denom": denom,
+                        "duration": {"num": num, "denom": denom},
                         "is_triplet": is_triplet,
                         "tie_start": tie_start,
                         "tie_stop": tie_stop,
                         "notes": notes_info
-                    })
+                    }
+                    m_items.append(item_dict)
+                    flat_events_list.append(dict(item_dict))
 
             formatted_measures.append({
                 "measure_number": m_num,
@@ -124,7 +199,8 @@ class MusicXMLScoreWriter:
             "time_signature": time_sig,
             "clef": clef,
             "total_measures": len(formatted_measures),
-            "measures": formatted_measures
+            "measures": formatted_measures,
+            "events": flat_events_list
         }
 
     def to_musicxml_string(
