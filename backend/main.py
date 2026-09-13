@@ -91,7 +91,7 @@ class ServerOrchestrator:
         self,
         port: int = 8085,
         enable_watchdog: bool = True,
-        watchdog_timeout_sec: float = 10.0
+        watchdog_timeout_sec: float = 30.0
     ):
         self.port = port
         self.enable_watchdog = enable_watchdog
@@ -102,7 +102,7 @@ class ServerOrchestrator:
         self.active_bpm = 120.0
 
         # Engines
-        self.audio_engine = AudioCaptureEngine(sample_rate=44100, rtl_latency_ms=15.0)
+        self.audio_engine = AudioCaptureEngine(sample_rate=44100, rtl_latency_ms=35.0)
         self.rhythm_transcriber = RhythmTranscriber(sample_rate=44100)
         self.piano_transcriber = PianoTranscriber(sample_rate=16000)
         self.vocal_transcriber = VocalTranscriber(sample_rate=22050)
@@ -166,7 +166,9 @@ class ServerOrchestrator:
         cmd = req.get("command", "").upper()
         logger.info("Received command: %s", cmd)
 
-        if cmd == "GET_STATUS":
+        if cmd in ["HANDSHAKE", "PING"]:
+            await self._handle_handshake(websocket, req)
+        elif cmd == "GET_STATUS":
             await self._handle_get_status(websocket)
         elif cmd == "SET_MODE":
             await self._handle_set_mode(websocket, req)
@@ -181,11 +183,27 @@ class ServerOrchestrator:
         else:
             await self._send_error(websocket, f"Unknown command: '{cmd}'")
 
+    async def _handle_handshake(self, websocket, req: Dict[str, Any]):
+        logger.info("Client handshake received from: %s", req.get("client", "unknown"))
+        self.cancel_watchdog()
+        await websocket.send(json.dumps({
+            "event": "HANDSHAKE_OK",
+            "type": "status",
+            "state": "ready",
+            "mode": self.mode,
+            "latency_ms": self.audio_engine.rtl_latency_ms,
+            "port": self.port,
+            "status": "ready",
+            "message": "AudioScoreTranscriber backend ready"
+        }))
+
     async def _handle_get_status(self, websocket):
         clipping_info = self.audio_engine.get_clipping_stats()
         resp = {
             "event": "STATUS",
+            "type": "status",
             "status": self.status,
+            "state": "recording" if self.status == "recording" else ("processing" if self.status == "transcribing" else "ready"),
             "mode": self.mode,
             "sample_rate": self.audio_engine.sample_rate,
             "latency_ms": self.audio_engine.rtl_latency_ms,
@@ -201,6 +219,7 @@ class ServerOrchestrator:
             logger.info("Active mode set to: %s", self.mode)
             await websocket.send(json.dumps({
                 "event": "MODE_SET",
+                "type": "status",
                 "mode": self.mode,
                 "status": "success"
             }))
@@ -209,10 +228,11 @@ class ServerOrchestrator:
 
     async def _handle_set_latency(self, websocket, req: Dict[str, Any]):
         try:
-            latency_ms = float(req.get("latency_ms", 15.0))
+            latency_ms = float(req.get("latency_ms", req.get("rtl_latency_ms", 35.0)))
             self.audio_engine.set_rtl_latency_ms(latency_ms)
             await websocket.send(json.dumps({
                 "event": "LATENCY_SET",
+                "type": "status",
                 "latency_ms": self.audio_engine.rtl_latency_ms,
                 "status": "success"
             }))
@@ -224,12 +244,28 @@ class ServerOrchestrator:
             await self._send_error(websocket, "Already recording.")
             return
 
+        # Update mode if provided
+        if "mode" in req:
+            req_mode = str(req.get("mode", "")).lower()
+            if req_mode in ["rhythm", "piano", "vocal"]:
+                self.mode = req_mode
+
+        # Update RTL latency if provided
+        lat = req.get("rtl_latency_ms", req.get("latency_ms"))
+        if lat is not None:
+            try:
+                self.audio_engine.set_rtl_latency_ms(float(lat))
+            except Exception:
+                pass
+
         success = self.audio_engine.start()
         if success:
             self.status = "recording"
-            logger.info("Started recording audio (mode=%s)", self.mode)
+            logger.info("Started recording audio (mode=%s, latency=%.1fms)", self.mode, self.audio_engine.rtl_latency_ms)
             await websocket.send(json.dumps({
                 "event": "RECORDING_STARTED",
+                "type": "status",
+                "state": "recording",
                 "status": "recording",
                 "mode": self.mode
             }))
@@ -247,6 +283,8 @@ class ServerOrchestrator:
 
         await websocket.send(json.dumps({
             "event": "RECORDING_STOPPED",
+            "type": "status",
+            "state": "processing",
             "status": "transcribing",
             "sample_count": len(audio_buffer),
             "duration_sec": round(len(audio_buffer) / self.audio_engine.sample_rate, 3)
@@ -270,8 +308,12 @@ class ServerOrchestrator:
         self.status = "idle"
         await websocket.send(json.dumps({
             "event": "TRANSCRIPTION_RESULT",
+            "type": "transcription_result",
+            "mode": self.mode,
+            "events": result_payload["qml_json"],
             "data": result_payload["qml_json"],
-            "musicxml": result_payload.get("musicxml", "")
+            "musicxml": result_payload.get("musicxml", ""),
+            "raw_notes_count": result_payload.get("raw_notes_count", 0)
         }))
 
     async def _handle_transcribe_audio(self, websocket, req: Dict[str, Any]):
@@ -362,6 +404,7 @@ class ServerOrchestrator:
         logger.warning("Sending error to client: %s", error_msg)
         await websocket.send(json.dumps({
             "event": "ERROR",
+            "type": "error",
             "message": error_msg
         }))
 
@@ -392,8 +435,8 @@ class ServerOrchestrator:
 def main():
     parser = argparse.ArgumentParser(description="AudioScoreTranscriber Python Backend")
     parser.add_argument("--port", type=int, default=8085, help="WebSocket port (default: 8085)")
-    parser.add_argument("--no-watchdog", action="store_true", help="Disable 10s anti-zombie auto-termination")
-    parser.add_argument("--watchdog-timeout", type=float, default=10.0, help="Watchdog timeout in seconds (default: 10.0)")
+    parser.add_argument("--no-watchdog", action="store_true", help="Disable anti-zombie auto-termination")
+    parser.add_argument("--watchdog-timeout", type=float, default=30.0, help="Watchdog timeout in seconds (default: 30.0)")
     args = parser.parse_args()
 
     # Single-instance lock on Windows

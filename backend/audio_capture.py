@@ -30,7 +30,7 @@ class AudioCaptureEngine:
         channels: int = 1,
         block_size: int = 512,
         buffer_duration_sec: float = 60.0,
-        rtl_latency_ms: float = 15.0,
+        rtl_latency_ms: float = 35.0,
         prefer_wasapi: bool = True
     ):
         self.sample_rate = sample_rate
@@ -60,6 +60,15 @@ class AudioCaptureEngine:
 
         # Selected input device index
         self._device_index = self._find_optimal_device()
+        if self._device_index is not None and sd is not None:
+            try:
+                dev_info = sd.query_devices(self._device_index)
+                native_sr = int(dev_info.get("default_samplerate", 0))
+                if native_sr > 0:
+                    self.sample_rate = native_sr
+                    logger.info("Using device native sample rate: %d Hz", self.sample_rate)
+            except Exception as e:
+                logger.debug("Could not query device sample rate: %s", e)
 
     def _find_optimal_device(self) -> Optional[int]:
         """Find the best input device, prioritizing WASAPI or ASIO on Windows."""
@@ -176,6 +185,9 @@ class AudioCaptureEngine:
                     host_api = sd.query_hostapis(dev_info["hostapi"])["name"]
                     if "WASAPI" in host_api:
                         extra_settings = sd.WasapiSettings(exclusive=False)
+                        native_sr = int(dev_info.get("default_samplerate", 0))
+                        if native_sr > 0:
+                            self.sample_rate = native_sr
                 except Exception as ex:
                     logger.debug("Could not apply WASAPI extra settings: %s", ex)
 
@@ -194,9 +206,21 @@ class AudioCaptureEngine:
                         self._device_index, self.sample_rate, self.block_size)
             return True
         except Exception as exc:
-            logger.error("Failed to start sounddevice stream: %s", exc)
-            # Still keep recording state active so simulation or fallback can proceed
-            return False
+            logger.warning("Failed to start sounddevice stream with device %s (sr=%d): %s. Trying fallback...",
+                           self._device_index, self.sample_rate, exc)
+            try:
+                self._stream = sd.InputStream(
+                    channels=self.channels,
+                    dtype="float32",
+                    callback=self._audio_callback
+                )
+                self._stream.start()
+                self.sample_rate = int(self._stream.samplerate)
+                logger.info("Audio stream started with default fallback device (sr=%d)", self.sample_rate)
+                return True
+            except Exception as exc2:
+                logger.error("Failed to start fallback sounddevice stream: %s", exc2)
+                return False
 
     def stop(self) -> np.ndarray:
         """Stop audio stream and return captured audio with RTL latency compensation."""

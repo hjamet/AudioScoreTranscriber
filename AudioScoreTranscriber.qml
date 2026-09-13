@@ -1,9 +1,10 @@
-import QtQuick 2.15
-import QtQuick.Controls 2.15
-import QtQuick.Layouts 1.15
-import QtQuick.Window 2.15
-import MuseScore 3.0
-import MuseScore.Playback 1.0
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Window
+import Muse.UiComponents
+import MuseScore.Playback
+import MuseScore
 import "ScoreCursorWriter.js" as ScoreCursorWriter
 
 MuseScore {
@@ -19,12 +20,18 @@ MuseScore {
     pluginType: "dialog"
     requiresScore: true
 
+    implicitWidth: 460
+    implicitHeight: 570
     width: 460
-    height: 680
+    height: 570
 
     // Palette système pour adaptation au thème MuseScore
     SystemPalette {
         id: sysPalette
+    }
+
+    QProcess {
+        id: qproc
     }
 
     // ========================================================================
@@ -43,9 +50,69 @@ MuseScore {
     property bool wsConnected: false
     property string wsStatus: "Déconnecté"
     property int wsPort: 8085
+    property bool backendStarting: false
+    property bool hasSelection: false
 
     // Playback state model
     property var playbackModel: null
+
+    function normalizePath(path) {
+        var p = path.toString();
+        var normalizedPath;
+        if (p.startsWith('file://')) {
+            normalizedPath = p.replace(/^file:\/\/\/?/, '');
+            if (Qt.platform.os !== "windows" && !normalizedPath.startsWith('/')) {
+                normalizedPath = "/" + normalizedPath;
+            }
+        } else {
+            normalizedPath = p;
+        }
+        return normalizedPath;
+    }
+
+    function startBackend() {
+        if (backendStarting || wsConnected) return;
+        backendStarting = true;
+        console.log("[AudioScoreTranscriber] Auto-lancement du backend Python via QProcess...");
+        var pluginDir = normalizePath(Qt.resolvedUrl("."));
+        if (!pluginDir.endsWith("/")) pluginDir += "/";
+        var batPath = pluginDir + "run_backend.bat";
+        var pyPath = pluginDir + "backend/main.py";
+
+        try {
+            if (Qt.platform.os === "windows") {
+                qproc.startWithArgs("cmd.exe", ["/c", batPath]);
+            } else {
+                qproc.startWithArgs("python3", [pyPath, "--port", "8085"]);
+            }
+        } catch (e) {
+            console.log("[AudioScoreTranscriber] Exception démarrage QProcess: " + e);
+            try {
+                qproc.startWithArgs("python", [pyPath, "--port", "8085"]);
+            } catch (e2) {
+                console.log("[AudioScoreTranscriber] Exception fallback python: " + e2);
+            }
+        }
+    }
+
+    function checkSelection() {
+        if (!curScore) return false;
+        try {
+            if (curScore.selection && curScore.selection.elements && curScore.selection.elements.length > 0) {
+                return true;
+            }
+            var c = curScore.newCursor();
+            if (c) {
+                c.rewind(1); // 1 = Cursor.SELECTION_START
+                if (c.segment || c.element) {
+                    return true;
+                }
+            }
+        } catch (e) {
+            // Silencieux
+        }
+        return false;
+    }
 
     PlaybackToolBarModel {
         id: directPlaybackModel
@@ -91,7 +158,7 @@ MuseScore {
     // ========================================================================
     function connectWebSocket() {
         if (wsConnected) return;
-        wsStatus = "Reconnexion...";
+        wsStatus = "Connexion...";
 
         try {
             if (typeof api !== "undefined" && api.websocket) {
@@ -99,7 +166,11 @@ MuseScore {
                     console.log("[AudioScoreTranscriber] WebSocket connecté avec socketId : " + sockId);
                     wsClientId = sockId;
                     wsConnected = true;
+                    backendStarting = false;
                     wsStatus = "Connecté";
+                    if (statusText === "Connexion au moteur..." || statusText === "Moteur non connecté") {
+                        statusText = "Prêt";
+                    }
 
                     api.websocket.onMessage(sockId, function(rawMsg) {
                         handleBackendMessage(rawMsg);
@@ -120,6 +191,9 @@ MuseScore {
 
         wsConnected = false;
         wsStatus = "Déconnecté";
+        if (!backendStarting) {
+            startBackend();
+        }
     }
 
     function sendWsJson(dataObj) {
@@ -143,7 +217,9 @@ MuseScore {
             var msg = JSON.parse(rawMsg);
             if (!msg) return;
 
-            if (msg.type === "status") {
+            var eventType = (msg.type || msg.event || "").toLowerCase();
+
+            if (eventType === "status" || eventType === "handshake_ok") {
                 if (msg.state === "countdown") {
                     appState = "countdown";
                     statusText = "Décompte : " + (msg.count !== undefined ? msg.count : "...");
@@ -161,11 +237,18 @@ MuseScore {
                     appState = "ready";
                     statusText = "Prêt";
                 }
-            } else if (msg.type === "vu_meter") {
+            } else if (eventType === "vu_meter") {
                 if (typeof msg.level === "number") {
                     vuMeterLevel = Math.max(0.0, Math.min(1.0, msg.level));
                 }
-            } else if (msg.type === "transcription_result") {
+            } else if (eventType === "recording_started") {
+                appState = "recording";
+                statusText = "Enregistrement en cours...";
+            } else if (eventType === "recording_stopped") {
+                appState = "processing";
+                statusText = "Traitement audio & Inférence...";
+            } else if (eventType === "transcription_result") {
+                dspTimeoutTimer.stop();
                 appState = "ready";
                 vuMeterLevel = 0.0;
 
@@ -175,7 +258,8 @@ MuseScore {
                 isRecording = false;
 
                 injectTranscriptionResult(msg);
-            } else if (msg.type === "error") {
+            } else if (eventType === "error") {
+                dspTimeoutTimer.stop();
                 statusText = "Erreur : " + (msg.message || "inconnue");
                 feedbackText = "❌ " + (msg.message || "Erreur backend");
                 appState = "ready";
@@ -195,7 +279,7 @@ MuseScore {
     function injectTranscriptionResult(result) {
         statusText = "Injection dans la partition...";
         var targetMode = result.mode || selectedMode;
-        var events = result.events || [];
+        var events = result.events || result.data || [];
         var res = null;
 
         if (targetMode === "rhythm") {
@@ -220,6 +304,17 @@ MuseScore {
     // Gestion du cycle d'enregistrement
     // ========================================================================
     function toggleRecording() {
+        if (!wsConnected) {
+            feedbackText = "⚠️ Connexion au moteur Python en cours...";
+            connectWebSocket();
+            return;
+        }
+
+        if (!hasSelection && !isRecording) {
+            feedbackText = "⚠️ Veuillez sélectionner une mesure ou une portée dans la partition.";
+            return;
+        }
+
         if (!isRecording) {
             // Démarrage
             isRecording = true;
@@ -251,6 +346,9 @@ MuseScore {
                 stopMuseScorePlayback();
             }
 
+            // Armement du timeout de sécurité DSP (8 secondes)
+            dspTimeoutTimer.restart();
+
             sendWsJson({
                 command: "stop_recording",
                 mode: selectedMode,
@@ -262,9 +360,40 @@ MuseScore {
     // ========================================================================
     // Timers de supervision & Reconnexion
     // ========================================================================
+
+    // Timeout de sécurité DSP (8 secondes max)
+    Timer {
+        id: dspTimeoutTimer
+        interval: 8000
+        repeat: false
+        running: false
+        onTriggered: {
+            console.log("[AudioScoreTranscriber] Timeout DSP atteint (8s).");
+            pluginRoot.appState = "ready";
+            pluginRoot.isRecording = false;
+            pluginRoot.vuMeterLevel = 0.0;
+            pluginRoot.statusText = "Prêt";
+            pluginRoot.feedbackText = "❌ Délai d'attente dépassé (aucune réponse DSP en 8s)";
+            if (overdubCheck.checked) {
+                pluginRoot.stopMuseScorePlayback();
+            }
+        }
+    }
+
+    // Surveillance continue de la sélection active dans MuseScore
+    Timer {
+        id: selectionCheckerTimer
+        interval: 300
+        running: true
+        repeat: true
+        onTriggered: {
+            pluginRoot.hasSelection = pluginRoot.checkSelection();
+        }
+    }
+
     Timer {
         id: wsReconnectTimer
-        interval: 3000
+        interval: 2000
         running: !pluginRoot.wsConnected
         repeat: true
         onTriggered: {
@@ -285,35 +414,41 @@ MuseScore {
 
     onRun: {
         console.log("[AudioScoreTranscriber] Démarrage du plugin");
+        hasSelection = checkSelection();
+        startBackend();
         connectWebSocket();
     }
 
     // ========================================================================
-    // Interface Graphique Épurée & Moderne (QtQuick Controls 2.15)
+    // Interface Graphique Épurée & Moderne (100% Compatible Qt 6 / MuseScore 4)
     // ========================================================================
     Rectangle {
         id: mainContainer
         anchors.fill: parent
         color: "#18181b" // Dark modern surface
 
-        ScrollView {
+        Flickable {
+            id: scrollArea
             anchors.fill: parent
-            contentWidth: parent.width
+            contentWidth: width
+            contentHeight: contentCol.implicitHeight + 36
             clip: true
+            boundsBehavior: Flickable.StopAtBounds
 
             ColumnLayout {
+                id: contentCol
                 width: mainContainer.width - 24
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: 14
 
-                Item { height: 6 } // Marge haute
+                Item { Layout.preferredHeight: 6; Layout.fillWidth: true } // Marge haute
 
                 // ------------------------------------------------------------
                 // 1. En-tête : Titre & Statut WebSocket
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 56
+                    Layout.preferredHeight: 56
                     radius: 8
                     color: "#27272a"
                     border.color: "#3f3f46"
@@ -335,11 +470,11 @@ MuseScore {
 
                         // Badge de statut WebSocket
                         Rectangle {
-                            height: 26
-                            width: wsRow.implicitWidth + 16
+                            Layout.preferredHeight: 26
+                            Layout.preferredWidth: wsRow.implicitWidth + 16
                             radius: 13
-                            color: pluginRoot.wsConnected ? "#064e3b" : (pluginRoot.wsStatus === "Reconnexion..." ? "#78350f" : "#450a0a")
-                            border.color: pluginRoot.wsConnected ? "#10b981" : (pluginRoot.wsStatus === "Reconnexion..." ? "#f59e0b" : "#ef4444")
+                            color: pluginRoot.wsConnected ? "#064e3b" : (pluginRoot.wsStatus === "Connexion..." || pluginRoot.backendStarting ? "#78350f" : "#450a0a")
+                            border.color: pluginRoot.wsConnected ? "#10b981" : (pluginRoot.wsStatus === "Connexion..." || pluginRoot.backendStarting ? "#f59e0b" : "#ef4444")
                             border.width: 1
 
                             RowLayout {
@@ -348,17 +483,17 @@ MuseScore {
                                 spacing: 6
 
                                 Rectangle {
-                                    width: 8
-                                    height: 8
+                                    Layout.preferredWidth: 8
+                                    Layout.preferredHeight: 8
                                     radius: 4
-                                    color: pluginRoot.wsConnected ? "#10b981" : (pluginRoot.wsStatus === "Reconnexion..." ? "#f59e0b" : "#ef4444")
+                                    color: pluginRoot.wsConnected ? "#10b981" : (pluginRoot.wsStatus === "Connexion..." || pluginRoot.backendStarting ? "#f59e0b" : "#ef4444")
                                 }
 
                                 Text {
-                                    text: pluginRoot.wsConnected ? "Port 8085 OK" : pluginRoot.wsStatus
+                                    text: pluginRoot.wsConnected ? "Moteur Prêt (8085)" : (pluginRoot.backendStarting ? "Démarrage moteur..." : pluginRoot.wsStatus)
                                     font.pixelSize: 11
                                     font.bold: true
-                                    color: pluginRoot.wsConnected ? "#a7f3d0" : (pluginRoot.wsStatus === "Reconnexion..." ? "#fde68a" : "#fecaca")
+                                    color: pluginRoot.wsConnected ? "#a7f3d0" : (pluginRoot.wsStatus === "Connexion..." || pluginRoot.backendStarting ? "#fde68a" : "#fecaca")
                                 }
                             }
 
@@ -366,6 +501,7 @@ MuseScore {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
+                                    pluginRoot.startBackend();
                                     pluginRoot.connectWebSocket();
                                 }
                             }
@@ -387,7 +523,7 @@ MuseScore {
                 // Carte Mode 1 : Rythme Seul
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 64
+                    Layout.preferredHeight: 64
                     radius: 8
                     color: pluginRoot.selectedMode === "rhythm" ? "#1e3a8a" : "#27272a"
                     border.color: pluginRoot.selectedMode === "rhythm" ? "#60a5fa" : "#3f3f46"
@@ -416,8 +552,8 @@ MuseScore {
                                     color: "#fafafa"
                                 }
                                 Rectangle {
-                                    height: 16
-                                    width: badgeRhythmText.implicitWidth + 8
+                                    Layout.preferredHeight: 18
+                                    Layout.preferredWidth: badgeRhythmText.implicitWidth + 10
                                     radius: 4
                                     color: "#1e293b"
                                     Text {
@@ -452,7 +588,7 @@ MuseScore {
                 // Carte Mode 2 : Piano Polyphonique
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 64
+                    Layout.preferredHeight: 64
                     radius: 8
                     color: pluginRoot.selectedMode === "piano" ? "#1e3a8a" : "#27272a"
                     border.color: pluginRoot.selectedMode === "piano" ? "#60a5fa" : "#3f3f46"
@@ -481,8 +617,8 @@ MuseScore {
                                     color: "#fafafa"
                                 }
                                 Rectangle {
-                                    height: 16
-                                    width: badgePianoText.implicitWidth + 8
+                                    Layout.preferredHeight: 18
+                                    Layout.preferredWidth: badgePianoText.implicitWidth + 10
                                     radius: 4
                                     color: "#1e293b"
                                     Text {
@@ -517,7 +653,7 @@ MuseScore {
                 // Carte Mode 3 : Chant Mélodique
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 64
+                    Layout.preferredHeight: 64
                     radius: 8
                     color: pluginRoot.selectedMode === "vocal" ? "#1e3a8a" : "#27272a"
                     border.color: pluginRoot.selectedMode === "vocal" ? "#60a5fa" : "#3f3f46"
@@ -546,8 +682,8 @@ MuseScore {
                                     color: "#fafafa"
                                 }
                                 Rectangle {
-                                    height: 16
-                                    width: badgeVocalText.implicitWidth + 8
+                                    Layout.preferredHeight: 18
+                                    Layout.preferredWidth: badgeVocalText.implicitWidth + 10
                                     radius: 4
                                     color: "#1e293b"
                                     Text {
@@ -580,48 +716,34 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 3. Curseur de Compensation de Latence RTL
+                // 3. Avertissement Sélection de Mesure Requise
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 72
-                    radius: 8
-                    color: "#27272a"
-                    border.color: "#3f3f46"
+                    Layout.preferredHeight: 38
+                    radius: 6
+                    color: "#451a03"
+                    border.color: "#f59e0b"
                     border.width: 1
+                    visible: !pluginRoot.hasSelection
 
-                    ColumnLayout {
+                    RowLayout {
                         anchors.fill: parent
-                        anchors.margins: 12
-                        spacing: 4
+                        anchors.margins: 8
+                        spacing: 8
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: "Compensation de latence aller-retour (RTL)"
-                                font.pixelSize: 12
-                                font.bold: true
-                                color: "#e4e4e7"
-                            }
-                            Item { Layout.fillWidth: true }
-                            Text {
-                                text: Math.round(latencySlider.value) + " ms"
-                                font.pixelSize: 12
-                                font.bold: true
-                                color: "#60a5fa"
-                            }
+                        Text {
+                            text: "⚠️"
+                            font.pixelSize: 14
                         }
 
-                        Slider {
-                            id: latencySlider
+                        Text {
+                            text: "Veuillez sélectionner une mesure ou une portée dans la partition"
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: "#fef3c7"
+                            wrapMode: Text.WordWrap
                             Layout.fillWidth: true
-                            from: 0
-                            to: 150
-                            stepSize: 1
-                            value: pluginRoot.rtlLatencyMs
-                            onMoved: {
-                                pluginRoot.rtlLatencyMs = Math.round(value);
-                            }
                         }
                     }
                 }
@@ -631,7 +753,7 @@ MuseScore {
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
-                    implicitHeight: overdubCol.implicitHeight + 20
+                    Layout.preferredHeight: overdubCol.implicitHeight + 20
                     radius: 8
                     color: "#27272a"
                     border.color: overdubCheck.checked ? "#d97706" : "#3f3f46"
@@ -643,22 +765,48 @@ MuseScore {
                         anchors.margins: 10
                         spacing: 8
 
+                        // Ligne Checkbox personnalisée (100% robuste, zéro dépendance controls)
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 8
 
-                            CheckBox {
+                            Rectangle {
                                 id: overdubCheck
-                                checked: true
+                                property bool checked: true
+                                Layout.preferredWidth: 20
+                                Layout.preferredHeight: 20
+                                radius: 4
+                                color: checked ? "#2563eb" : "#3f3f46"
+                                border.color: checked ? "#60a5fa" : "#71717a"
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "✓"
+                                    font.pixelSize: 13
+                                    font.bold: true
+                                    color: "#ffffff"
+                                    visible: overdubCheck.checked
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: overdubCheck.checked = !overdubCheck.checked
+                                }
+                            }
+
+                            Text {
                                 text: "Overdubbing / Playback MuseScore synchrone"
                                 font.pixelSize: 12
                                 font.bold: true
-                                contentItem: Text {
-                                    text: overdubCheck.text
-                                    font: overdubCheck.font
-                                    color: "#fafafa"
-                                    leftPadding: overdubCheck.indicator.width + 6
-                                    verticalAlignment: Text.AlignVCenter
+                                color: "#fafafa"
+                                Layout.fillWidth: true
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: overdubCheck.checked = !overdubCheck.checked
                                 }
                             }
                         }
@@ -666,7 +814,7 @@ MuseScore {
                         // Avertissement Casque Audio Obligatoire
                         Rectangle {
                             Layout.fillWidth: true
-                            height: 38
+                            Layout.preferredHeight: 38
                             radius: 6
                             color: "#451a03"
                             border.color: "#f59e0b"
@@ -700,10 +848,14 @@ MuseScore {
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
-                    height: 84
+                    Layout.preferredHeight: 90
                     radius: 10
-                    color: pluginRoot.isRecording ? "#7f1d1d" : "#1e293b"
-                    border.color: pluginRoot.isRecording ? "#ef4444" : "#3b82f6"
+                    color: !pluginRoot.wsConnected ? "#27272a" :
+                           (!pluginRoot.hasSelection && !pluginRoot.isRecording ? "#27272a" :
+                           (pluginRoot.isRecording ? "#7f1d1d" : "#1e293b"))
+                    border.color: !pluginRoot.wsConnected ? "#52525b" :
+                                  (!pluginRoot.hasSelection && !pluginRoot.isRecording ? "#d97706" :
+                                  (pluginRoot.isRecording ? "#ef4444" : "#3b82f6"))
                     border.width: 2
 
                     ColumnLayout {
@@ -717,10 +869,12 @@ MuseScore {
                             spacing: 8
 
                             Rectangle {
-                                width: 10
-                                height: 10
+                                Layout.preferredWidth: 10
+                                Layout.preferredHeight: 10
                                 radius: 5
-                                color: pluginRoot.isRecording ? "#ef4444" : (pluginRoot.appState === "processing" ? "#f59e0b" : "#10b981")
+                                color: !pluginRoot.wsConnected ? "#71717a" :
+                                       (pluginRoot.isRecording ? "#ef4444" :
+                                       (pluginRoot.appState === "processing" ? "#f59e0b" : "#10b981"))
 
                                 SequentialAnimation on opacity {
                                     running: pluginRoot.isRecording || pluginRoot.appState === "processing"
@@ -731,7 +885,9 @@ MuseScore {
                             }
 
                             Text {
-                                text: pluginRoot.statusText
+                                text: !pluginRoot.wsConnected ? "En attente du moteur Python..." :
+                                      (!pluginRoot.hasSelection && !pluginRoot.isRecording ? "Sélection requise" :
+                                      pluginRoot.statusText)
                                 font.pixelSize: 12
                                 font.bold: true
                                 color: "#f4f4f5"
@@ -741,8 +897,8 @@ MuseScore {
 
                             // VU-Mètre horizontal
                             Rectangle {
-                                width: 90
-                                height: 8
+                                Layout.preferredWidth: 90
+                                Layout.preferredHeight: 8
                                 radius: 4
                                 color: "#334155"
                                 clip: true
@@ -756,32 +912,46 @@ MuseScore {
                             }
                         }
 
-                        // Bouton principal d'action
-                        Button {
+                        // Bouton principal d'action personnalisé (100% robuste & interactif)
+                        Rectangle {
                             id: mainActionButton
                             Layout.fillWidth: true
-                            Layout.fillHeight: true
+                            Layout.preferredHeight: 44
+                            radius: 6
+                            property bool canClick: pluginRoot.wsConnected &&
+                                                   (pluginRoot.appState !== "processing") &&
+                                                   (pluginRoot.isRecording || pluginRoot.hasSelection)
+                            color: !pluginRoot.wsConnected ? "#3f3f46" :
+                                   (pluginRoot.appState === "processing" ? "#d97706" :
+                                   (pluginRoot.isRecording ? "#dc2626" :
+                                   (!pluginRoot.hasSelection ? "#3f3f46" :
+                                   (actionMouseArea.pressed ? "#1d4ed8" : "#2563eb"))))
+                            opacity: canClick ? 1.0 : 0.65
+                            border.color: !pluginRoot.wsConnected ? "#52525b" :
+                                          (pluginRoot.isRecording ? "#fca5a5" :
+                                          (pluginRoot.appState === "processing" ? "#fcd34d" :
+                                          (!pluginRoot.hasSelection ? "#71717a" : "#93c5fd")))
+                            border.width: 1
 
-                            contentItem: Text {
-                                text: pluginRoot.isRecording ? "⏹️  ARRÊTER & TRANSCRIRE" :
-                                      (pluginRoot.appState === "processing" ? "⚙️  TRAITEMENT DSP EN COURS..." : "🔴  ENREGISTRER")
-                                font.pixelSize: 14
+                            Text {
+                                anchors.centerIn: parent
+                                text: !pluginRoot.wsConnected ? "⏳  CONNEXION AU MOTEUR..." :
+                                      (pluginRoot.appState === "processing" ? "⚙️  TRAITEMENT DSP EN COURS..." :
+                                      (pluginRoot.isRecording ? "⏹️  ARRÊTER & TRANSCRIRE" :
+                                      (!pluginRoot.hasSelection ? "⚠️  SÉLECTIONNER UNE MESURE D'ABORD" : "🔴  ENREGISTRER")))
+                                font.pixelSize: 13
                                 font.bold: true
                                 color: "#ffffff"
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
                             }
 
-                            background: Rectangle {
-                                radius: 6
-                                color: pluginRoot.isRecording ? "#dc2626" :
-                                       (pluginRoot.appState === "processing" ? "#d97706" : "#2563eb")
-                            }
-
-                            cursorShape: Qt.PointingHandCursor
-                            enabled: pluginRoot.appState !== "processing"
-                            onClicked: {
-                                pluginRoot.toggleRecording();
+                            MouseArea {
+                                id: actionMouseArea
+                                anchors.fill: parent
+                                cursorShape: mainActionButton.canClick ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                enabled: mainActionButton.canClick
+                                onClicked: {
+                                    pluginRoot.toggleRecording();
+                                }
                             }
                         }
                     }
@@ -801,54 +971,7 @@ MuseScore {
                     visible: pluginRoot.feedbackText !== ""
                 }
 
-                // ------------------------------------------------------------
-                // 7. Barre d'outils de test direct (Diagnostic in-situ)
-                // ------------------------------------------------------------
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 6
-                    Layout.topMargin: 4
-
-                    Text {
-                        text: "Test direct partition :"
-                        font.pixelSize: 10
-                        color: "#71717a"
-                    }
-
-                    Item { Layout.fillWidth: true }
-
-                    Button {
-                        text: "Test 🥁 Rythme"
-                        font.pixelSize: 10
-                        implicitHeight: 24
-                        onClicked: {
-                            var r = ScoreCursorWriter.testInjection("rhythm", curScore);
-                            pluginRoot.feedbackText = r.success ? "✅ Test Rythme injecté (" + r.count + " notes)" : "❌ " + r.error;
-                        }
-                    }
-
-                    Button {
-                        text: "Test 🎹 Piano"
-                        font.pixelSize: 10
-                        implicitHeight: 24
-                        onClicked: {
-                            var r = ScoreCursorWriter.testInjection("piano", curScore);
-                            pluginRoot.feedbackText = r.success ? "✅ Test Piano injecté (" + r.count + " notes)" : "❌ " + r.error;
-                        }
-                    }
-
-                    Button {
-                        text: "Test 🎤 Chant"
-                        font.pixelSize: 10
-                        implicitHeight: 24
-                        onClicked: {
-                            var r = ScoreCursorWriter.testInjection("vocal", curScore);
-                            pluginRoot.feedbackText = r.success ? "✅ Test Chant injecté (" + r.count + " notes)" : "❌ " + r.error;
-                        }
-                    }
-                }
-
-                Item { height: 12 } // Marge basse
+                Item { Layout.preferredHeight: 12; Layout.fillWidth: true } // Marge basse
             }
         }
     }
