@@ -1,0 +1,51 @@
+﻿# Python virtual environments & packages
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Audio files & Recordings (scratch / takes)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+recordings/
+takes/
+
+# Deep learning models & weights cache
+models/cache/
+*.onnx
+*.pt
+*.pth
+*.tflite
+*.ckpt
+
+# MuseScore project & backup files
+*.mscz
+*.mscx
+.*.mscz#
+.*.mscx#
+
+# Logs & Diagnostics
+logs/
+*.log
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,27 @@
+﻿# Core scientific & audio processing
+numpy>=1.24.0,<2.1.0
+scipy>=1.11.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+librosa>=0.10.1
+
+# Deep learning & Neural pitch tracking
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Symbolic music, MIDI & MusicXML representation
+mido>=1.3.0
+music21>=9.1.0
+partitura>=1.4.0
+
+# Polyphonic transcription models
+basic-pitch>=0.2.5
+
+# Real-time IPC & WebSocket communication
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Utilities & Visualization
+Pillow>=10.0.0
+tqdm>=4.66.0
+pydantic>=2.5.0
