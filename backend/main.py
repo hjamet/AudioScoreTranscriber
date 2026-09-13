@@ -31,7 +31,7 @@ if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
 # Internal modules
-from audio_capture import AudioCaptureEngine
+from audio_capture import AudioCaptureEngine, get_audio_input_devices
 from transcriber.rhythm_transcriber import RhythmTranscriber
 from transcriber.piano_transcriber import PianoTranscriber
 from transcriber.vocal_transcriber import VocalTranscriber
@@ -81,6 +81,36 @@ class SingleInstanceLock:
             self.file_handle = None
 
 
+PREFS_FILE = os.path.join(tempfile.gettempdir(), "audioscoretranscriber_prefs.json")
+
+
+def load_saved_device_idx() -> Optional[int]:
+    """Load saved input device index preference."""
+    try:
+        if os.path.exists(PREFS_FILE):
+            with open(PREFS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                idx = data.get("selected_device_index")
+                if isinstance(idx, int):
+                    return idx
+    except Exception as exc:
+        logger.debug("Could not read device preferences: %s", exc)
+    return None
+
+
+def save_device_pref(device_idx: int, device_name: str = ""):
+    """Save selected input device index preference."""
+    try:
+        with open(PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "selected_device_index": device_idx,
+                "device_name": device_name
+            }, f, indent=2)
+        logger.info("Saved device preference: index #%d (%s)", device_idx, device_name)
+    except Exception as exc:
+        logger.debug("Could not save device preferences: %s", exc)
+
+
 class ServerOrchestrator:
     """
     Main audio transcription server orchestrator managing WebSocket clients,
@@ -103,6 +133,12 @@ class ServerOrchestrator:
 
         # Engines
         self.audio_engine = AudioCaptureEngine(sample_rate=44100, rtl_latency_ms=35.0)
+
+        # Restore saved input device preference if valid
+        saved_idx = load_saved_device_idx()
+        if saved_idx is not None:
+            self.audio_engine.set_device(saved_idx)
+
         self.rhythm_transcriber = RhythmTranscriber(sample_rate=44100)
         self.piano_transcriber = PianoTranscriber(sample_rate=16000)
         self.vocal_transcriber = VocalTranscriber(sample_rate=22050)
@@ -168,6 +204,10 @@ class ServerOrchestrator:
 
         if cmd in ["HANDSHAKE", "PING"]:
             await self._handle_handshake(websocket, req)
+        elif cmd == "GET_DEVICES":
+            await self._send_devices_list(websocket)
+        elif cmd == "SET_DEVICE":
+            await self._handle_set_device(websocket, req)
         elif cmd == "GET_STATUS":
             await self._handle_get_status(websocket)
         elif cmd == "SET_MODE":
@@ -183,6 +223,45 @@ class ServerOrchestrator:
         else:
             await self._send_error(websocket, f"Unknown command: '{cmd}'")
 
+    async def _send_devices_list(self, websocket):
+        """Send the list of available audio input devices and current selection to the client."""
+        devices = self.audio_engine.get_devices()
+        current_dev = self.audio_engine.device_index
+        if current_dev is None and devices:
+            current_dev = devices[0]["index"]
+
+        payload = {
+            "event": "DEVICES_LIST",
+            "type": "devices_list",
+            "devices": devices,
+            "current_device": current_dev
+        }
+        logger.info("Sending devices list (%d devices, current=%s)", len(devices), current_dev)
+        await websocket.send(json.dumps(payload))
+
+    async def _handle_set_device(self, websocket, req: Dict[str, Any]):
+        """Handle SET_DEVICE command to change active input device."""
+        device_idx = req.get("device_index")
+        if device_idx is not None:
+            try:
+                idx = int(device_idx)
+                success = self.audio_engine.set_device(idx)
+                if success:
+                    save_device_pref(idx)
+                    logger.info("Audio input device set to index #%d", idx)
+                    await websocket.send(json.dumps({
+                        "event": "DEVICE_SET",
+                        "type": "device_set",
+                        "current_device": idx,
+                        "status": "success"
+                    }))
+                else:
+                    await self._send_error(websocket, f"Failed to set audio device to index #{idx}")
+            except Exception as exc:
+                await self._send_error(websocket, f"Invalid device_index: {exc}")
+        else:
+            await self._send_error(websocket, "Missing 'device_index' parameter")
+
     async def _handle_handshake(self, websocket, req: Dict[str, Any]):
         logger.info("Client handshake received from: %s", req.get("client", "unknown"))
         self.cancel_watchdog()
@@ -194,8 +273,10 @@ class ServerOrchestrator:
             "latency_ms": self.audio_engine.rtl_latency_ms,
             "port": self.port,
             "status": "ready",
+            "current_device": self.audio_engine.device_index,
             "message": "AudioScoreTranscriber backend ready"
         }))
+        await self._send_devices_list(websocket)
 
     async def _handle_get_status(self, websocket):
         clipping_info = self.audio_engine.get_clipping_stats()
@@ -205,6 +286,7 @@ class ServerOrchestrator:
             "status": self.status,
             "state": "recording" if self.status == "recording" else ("processing" if self.status == "transcribing" else "ready"),
             "mode": self.mode,
+            "current_device": self.audio_engine.device_index,
             "sample_rate": self.audio_engine.sample_rate,
             "latency_ms": self.audio_engine.rtl_latency_ms,
             "is_recording": self.audio_engine.is_recording,
@@ -257,6 +339,14 @@ class ServerOrchestrator:
                 self.audio_engine.set_rtl_latency_ms(float(lat))
             except Exception:
                 pass
+
+        # Update device if provided
+        dev_idx = req.get("device_index")
+        if dev_idx is not None:
+            try:
+                self.audio_engine.set_device(int(dev_idx))
+            except Exception as ex:
+                logger.warning("Could not set device from start_recording: %s", ex)
 
         success = self.audio_engine.start()
         if success:

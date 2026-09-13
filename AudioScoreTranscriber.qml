@@ -21,9 +21,9 @@ MuseScore {
     requiresScore: true
 
     implicitWidth: 460
-    implicitHeight: 570
+    implicitHeight: 630
     width: 460
-    height: 570
+    height: 630
 
     // Palette système pour adaptation au thème MuseScore
     SystemPalette {
@@ -44,6 +44,12 @@ MuseScore {
     property string statusText: "Prêt"
     property string feedbackText: ""
     property real vuMeterLevel: 0.0
+
+    // État du sélecteur d'entrée audio (Microphone)
+    property var audioDevices: []
+    property int selectedDeviceIndex: -1
+    property string selectedDeviceName: "Recherche des micros..."
+    property bool micDropdownOpen: false
 
     // WebSocket state
     property int wsClientId: -1
@@ -154,6 +160,28 @@ MuseScore {
     }
 
     // ========================================================================
+    // Méthodes de Gestion du Périphérique d'Entrée Audio
+    // ========================================================================
+    function selectDevice(deviceIndex, deviceName) {
+        pluginRoot.selectedDeviceIndex = deviceIndex;
+        pluginRoot.selectedDeviceName = deviceName;
+        console.log("[AudioScoreTranscriber] Périphérique micro sélectionné : #" + deviceIndex + " (" + deviceName + ")");
+        sendWsJson({
+            command: "set_device",
+            device_index: deviceIndex
+        });
+    }
+
+    function refreshDevices() {
+        console.log("[AudioScoreTranscriber] Actualisation de la liste des périphériques audio...");
+        if (wsConnected) {
+            sendWsJson({
+                command: "get_devices"
+            });
+        }
+    }
+
+    // ========================================================================
     // Méthodes WebSocket (Communication Backend Python port 8085)
     // ========================================================================
     function connectWebSocket() {
@@ -176,11 +204,14 @@ MuseScore {
                         handleBackendMessage(rawMsg);
                     });
 
-                    // Handshake initial
+                    // Handshake initial & requête de la liste des micros
                     sendWsJson({
                         command: "handshake",
                         client: "AudioScoreTranscriber_QML",
                         version: "1.0.0"
+                    });
+                    sendWsJson({
+                        command: "get_devices"
                     });
                 });
                 return;
@@ -247,6 +278,62 @@ MuseScore {
             } else if (eventType === "recording_stopped") {
                 appState = "processing";
                 statusText = "Traitement audio & Inférence...";
+            } else if (eventType === "devices_list") {
+                if (msg.devices && Array.isArray(msg.devices)) {
+                    pluginRoot.audioDevices = msg.devices;
+                    var found = false;
+                    var targetIdx = (typeof msg.current_device === "number" && msg.current_device >= 0) ? msg.current_device : -1;
+
+                    // Conserver la sélection existante si toujours présente
+                    if (pluginRoot.selectedDeviceIndex >= 0) {
+                        for (var i = 0; i < msg.devices.length; i++) {
+                            if (msg.devices[i].index === pluginRoot.selectedDeviceIndex) {
+                                pluginRoot.selectedDeviceName = msg.devices[i].display_name || msg.devices[i].name;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Sinon appliquer le périphérique courant du backend
+                    if (!found && targetIdx >= 0) {
+                        for (var j = 0; j < msg.devices.length; j++) {
+                            if (msg.devices[j].index === targetIdx) {
+                                pluginRoot.selectedDeviceIndex = targetIdx;
+                                pluginRoot.selectedDeviceName = msg.devices[j].display_name || msg.devices[j].name;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Repli intelligent : recherche de l'HyperX QuadCast ou du périphérique par défaut
+                    if (!found && msg.devices.length > 0) {
+                        var chosenDev = msg.devices[0];
+                        for (var k = 0; k < msg.devices.length; k++) {
+                            var dName = (msg.devices[k].name || "").toLowerCase();
+                            if (dName.indexOf("hyperx") !== -1 || dName.indexOf("quadcast") !== -1) {
+                                chosenDev = msg.devices[k];
+                                break;
+                            } else if (msg.devices[k].is_default) {
+                                chosenDev = msg.devices[k];
+                            }
+                        }
+                        pluginRoot.selectedDeviceIndex = chosenDev.index;
+                        pluginRoot.selectedDeviceName = chosenDev.display_name || chosenDev.name;
+                    }
+                    console.log("[AudioScoreTranscriber] Micros disponibles : " + msg.devices.length + ", actif : #" + pluginRoot.selectedDeviceIndex + " (" + pluginRoot.selectedDeviceName + ")");
+                }
+            } else if (eventType === "device_set") {
+                if (typeof msg.current_device === "number") {
+                    pluginRoot.selectedDeviceIndex = msg.current_device;
+                    for (var m = 0; m < pluginRoot.audioDevices.length; m++) {
+                        if (pluginRoot.audioDevices[m].index === msg.current_device) {
+                            pluginRoot.selectedDeviceName = pluginRoot.audioDevices[m].display_name || pluginRoot.audioDevices[m].name;
+                            break;
+                        }
+                    }
+                }
             } else if (eventType === "transcription_result") {
                 dspTimeoutTimer.stop();
                 appState = "ready";
@@ -333,6 +420,7 @@ MuseScore {
                 command: "start_recording",
                 mode: selectedMode,
                 rtl_latency_ms: rtlLatencyMs,
+                device_index: pluginRoot.selectedDeviceIndex >= 0 ? pluginRoot.selectedDeviceIndex : undefined,
                 overdub: overdubCheck.checked
             });
         } else {
@@ -510,7 +598,218 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 2. Sélecteur 3 Modes d'Enregistrement
+                // 2. Sélecteur de Périphérique Audio (Microphone)
+                // ------------------------------------------------------------
+                Text {
+                    text: "ENTRÉE VOCALE (MICROPHONE)"
+                    font.pixelSize: 11
+                    font.bold: true
+                    color: "#a1a1aa"
+                    Layout.topMargin: 2
+                }
+
+                Rectangle {
+                    id: micSelectorCard
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: pluginRoot.micDropdownOpen ? Math.min(260, 52 + (pluginRoot.audioDevices.length * 36) + 12) : 52
+                    radius: 8
+                    color: "#27272a"
+                    border.color: pluginRoot.micDropdownOpen ? "#60a5fa" : "#3f3f46"
+                    border.width: pluginRoot.micDropdownOpen ? 2 : 1
+                    clip: true
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        spacing: 6
+
+                        // Barre principale du sélecteur
+                        RowLayout {
+                            id: micHeaderRow
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 36
+                            spacing: 10
+
+                            // Clic sur l'icône et le nom pour déplier/replier
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+
+                                Text {
+                                    text: "🎙️"
+                                    font.pixelSize: 20
+                                    Layout.leftMargin: 4
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 1
+
+                                    Text {
+                                        text: "Microphone sélectionné"
+                                        font.pixelSize: 10
+                                        color: "#a1a1aa"
+                                    }
+
+                                    Text {
+                                        text: pluginRoot.selectedDeviceName
+                                        font.pixelSize: 12
+                                        font.bold: true
+                                        color: "#fafafa"
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        pluginRoot.micDropdownOpen = !pluginRoot.micDropdownOpen;
+                                    }
+                                }
+                            }
+
+                            // Bouton d'actualisation discret
+                            Rectangle {
+                                Layout.preferredWidth: 28
+                                Layout.preferredHeight: 28
+                                radius: 4
+                                color: refreshMouseArea.containsMouse ? "#3f3f46" : "#1e1e24"
+                                border.color: "#3f3f46"
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "🔄"
+                                    font.pixelSize: 12
+                                }
+
+                                MouseArea {
+                                    id: refreshMouseArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        pluginRoot.refreshDevices();
+                                    }
+                                }
+                            }
+
+                            // Chevron indicateur déroulant
+                            Rectangle {
+                                Layout.preferredWidth: 28
+                                Layout.preferredHeight: 28
+                                radius: 4
+                                color: chevronMouseArea.containsMouse ? "#3f3f46" : "#1e1e24"
+                                border.color: "#3f3f46"
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: pluginRoot.micDropdownOpen ? "▲" : "▼"
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    color: "#fafafa"
+                                }
+
+                                MouseArea {
+                                    id: chevronMouseArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        pluginRoot.micDropdownOpen = !pluginRoot.micDropdownOpen;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Séparateur fin
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            color: "#3f3f46"
+                            visible: pluginRoot.micDropdownOpen
+                        }
+
+                        // Liste déroulante des périphériques
+                        Flickable {
+                            id: micListFlickable
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            contentWidth: width
+                            contentHeight: micItemsCol.implicitHeight
+                            clip: true
+                            visible: pluginRoot.micDropdownOpen
+                            boundsBehavior: Flickable.StopAtBounds
+
+                            ColumnLayout {
+                                id: micItemsCol
+                                width: micListFlickable.width
+                                spacing: 4
+
+                                Repeater {
+                                    model: pluginRoot.audioDevices
+
+                                    Rectangle {
+                                        id: devItemRect
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 32
+                                        radius: 6
+                                        property bool isSelected: modelData.index === pluginRoot.selectedDeviceIndex
+                                        color: isSelected ? "#1e3a8a" : (itemMouseArea.containsMouse ? "#3f3f46" : "#18181b")
+                                        border.color: isSelected ? "#60a5fa" : "transparent"
+                                        border.width: 1
+
+                                        RowLayout {
+                                            anchors.fill: parent
+                                            anchors.leftMargin: 8
+                                            anchors.rightMargin: 8
+                                            spacing: 6
+
+                                            Text {
+                                                text: devItemRect.isSelected ? "✓" : "•"
+                                                font.pixelSize: 11
+                                                font.bold: true
+                                                color: devItemRect.isSelected ? "#60a5fa" : "#71717a"
+                                            }
+
+                                            Text {
+                                                text: modelData.display_name || modelData.name
+                                                font.pixelSize: 11
+                                                font.bold: devItemRect.isSelected
+                                                color: devItemRect.isSelected ? "#ffffff" : "#e4e4e7"
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                            }
+
+                                            Text {
+                                                text: modelData.default_samplerate ? (modelData.default_samplerate + " Hz") : ""
+                                                font.pixelSize: 9
+                                                color: devItemRect.isSelected ? "#93c5fd" : "#71717a"
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            id: itemMouseArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                pluginRoot.selectDevice(modelData.index, modelData.display_name || modelData.name);
+                                                pluginRoot.micDropdownOpen = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 3. Sélecteur 3 Modes d'Enregistrement
                 // ------------------------------------------------------------
                 Text {
                     text: "MODE DE TRANSCRIPTION"
@@ -716,7 +1015,7 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 3. Avertissement Sélection de Mesure Requise
+                // 4. Avertissement Sélection de Mesure Requise
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
@@ -749,7 +1048,7 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 4. Checkbox Overdubbing & Avertissement Casque
+                // 5. Checkbox Overdubbing & Avertissement Casque
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
@@ -844,7 +1143,7 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 5. Bouton Principal Enregistrer / Arrêter & Indicateur d'état
+                // 6. Bouton Principal Enregistrer / Arrêter & Indicateur d'état
                 // ------------------------------------------------------------
                 Rectangle {
                     Layout.fillWidth: true
@@ -958,7 +1257,7 @@ MuseScore {
                 }
 
                 // ------------------------------------------------------------
-                // 6. Message de Feedback & Résultats
+                // 7. Message de Feedback & Résultats
                 // ------------------------------------------------------------
                 Text {
                     id: feedbackLabel

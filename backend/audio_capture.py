@@ -7,7 +7,7 @@ circular recording buffer, clipping detection, and Round-Trip Latency (RTL) comp
 import sys
 import threading
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 
 try:
@@ -16,6 +16,76 @@ except ImportError:
     sd = None
 
 logger = logging.getLogger(__name__)
+
+
+def get_audio_input_devices() -> List[Dict[str, Any]]:
+    """
+    List all available and valid audio input devices via sounddevice.
+    Filters devices with max_input_channels > 0 and excludes broken WDM-KS devices.
+    Returns list of dicts: index, name, display_name, hostapi, channels, default_samplerate, is_default.
+    """
+    if sd is None:
+        logger.warning("sounddevice not available, returning simulated device")
+        return [{
+            "index": 0,
+            "name": "Simulated Microphone",
+            "display_name": "Simulated Microphone",
+            "hostapi": "Mock",
+            "channels": 1,
+            "default_samplerate": 44100,
+            "is_default": True
+        }]
+
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        default_idx = None
+        try:
+            default_idx = sd.default.device[0]
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("Error querying sound devices: %s", exc)
+        return []
+
+    input_devices = []
+    for idx, d in enumerate(devices):
+        if d.get("max_input_channels", 0) > 0:
+            api_idx = d.get("hostapi", 0)
+            api_name = hostapis[api_idx]["name"] if api_idx < len(hostapis) else ""
+
+            # Exclude Windows WDM-KS devices as PortAudio has severe bugs / error -9999 with them
+            if "WDM-KS" in api_name:
+                continue
+
+            clean_name = d.get("name", f"Audio Device #{idx}").strip()
+
+            api_tag = ""
+            if "WASAPI" in api_name:
+                api_tag = "WASAPI"
+            elif "DirectSound" in api_name:
+                api_tag = "DirectSound"
+            elif "MME" in api_name:
+                api_tag = "MME"
+            elif "ASIO" in api_name:
+                api_tag = "ASIO"
+            elif api_name:
+                api_tag = api_name
+
+            display_name = f"{clean_name} ({api_tag})" if api_tag else clean_name
+            is_default = (idx == default_idx)
+
+            input_devices.append({
+                "index": idx,
+                "name": clean_name,
+                "display_name": display_name,
+                "hostapi": api_name,
+                "channels": d.get("max_input_channels", 1),
+                "default_samplerate": int(d.get("default_samplerate", 44100)),
+                "is_default": is_default
+            })
+
+    return input_devices
 
 
 class AudioCaptureEngine:
@@ -44,12 +114,6 @@ class AudioCaptureEngine:
         self._is_recording = False
         self._stream: Optional[Any] = None
 
-        # Circular buffer allocation
-        self._max_buffer_samples = int(self.sample_rate * self.buffer_duration_sec)
-        self._circular_buffer = np.zeros(self._max_buffer_samples, dtype=np.float32)
-        self._write_pos = 0
-        self._total_samples_written = 0
-
         # Linear session recording buffer
         self._recorded_chunks = []
 
@@ -69,6 +133,12 @@ class AudioCaptureEngine:
                     logger.info("Using device native sample rate: %d Hz", self.sample_rate)
             except Exception as e:
                 logger.debug("Could not query device sample rate: %s", e)
+
+        # Circular buffer allocation
+        self._max_buffer_samples = int(self.sample_rate * self.buffer_duration_sec)
+        self._circular_buffer = np.zeros(self._max_buffer_samples, dtype=np.float32)
+        self._write_pos = 0
+        self._total_samples_written = 0
 
     def _find_optimal_device(self) -> Optional[int]:
         """Find the best input device, prioritizing WASAPI or ASIO on Windows."""
@@ -159,8 +229,55 @@ class AudioCaptureEngine:
                 self._write_pos = (self._write_pos + num_samples) % self._max_buffer_samples
                 self._total_samples_written += num_samples
 
-    def start(self) -> bool:
+    @property
+    def device_index(self) -> Optional[int]:
+        with self._lock:
+            return self._device_index
+
+    def set_device(self, device_index: Optional[int]) -> bool:
+        """Set the active input device index and adapt native sample rate."""
+        with self._lock:
+            if self._is_recording:
+                logger.warning("Cannot change audio device while recording is active")
+                return False
+
+            if device_index is None:
+                self._device_index = None
+                return True
+
+            if sd is None:
+                self._device_index = device_index
+                return True
+
+            try:
+                dev_info = sd.query_devices(device_index)
+                if dev_info.get("max_input_channels", 0) <= 0:
+                    logger.warning("Device #%d has no input channels", device_index)
+                    return False
+                self._device_index = device_index
+                native_sr = int(dev_info.get("default_samplerate", 0))
+                if native_sr > 0 and native_sr != self.sample_rate:
+                    self.sample_rate = native_sr
+                    self._max_buffer_samples = int(self.sample_rate * self.buffer_duration_sec)
+                    self._circular_buffer = np.zeros(self._max_buffer_samples, dtype=np.float32)
+                    self._write_pos = 0
+                    self._total_samples_written = 0
+                logger.info("Device #%d selected: %s (native sr: %d Hz)",
+                            device_index, dev_info.get("name"), self.sample_rate)
+                return True
+            except Exception as exc:
+                logger.error("Error setting device #%s: %s", device_index, exc)
+                return False
+
+    def get_devices(self) -> List[Dict[str, Any]]:
+        """Return available audio input devices."""
+        return get_audio_input_devices()
+
+    def start(self, device_index: Optional[int] = None) -> bool:
         """Start audio ingestion stream."""
+        if device_index is not None:
+            self.set_device(device_index)
+
         with self._lock:
             if self._is_recording:
                 logger.warning("Audio capture already active")
